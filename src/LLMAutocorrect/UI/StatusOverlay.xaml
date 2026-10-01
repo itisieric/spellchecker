@@ -1,0 +1,12 @@
+<Window x:Class="LLMAutocorrect.UI.StatusOverlay"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ShowInTaskbar="False" ShowActivated="False" Topmost="True"
+        SizeToContent="WidthAndHeight" Focusable="False">
+  <Border Background="#EE202124" BorderBrush="#665F6368" BorderThickness="1"
+          CornerRadius="6" Padding="10,7" MaxWidth="420">
+    <TextBlock x:Name="MessageText" Foreground="#FFF1F3F4" FontSize="13"
+               TextWrapping="Wrap" MaxWidth="390" />
+  </Border>
+</Window>

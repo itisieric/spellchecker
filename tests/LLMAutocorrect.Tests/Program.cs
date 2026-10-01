@@ -1,0 +1,874 @@
+using LLMAutocorrect.Autocomplete;
+using LLMAutocorrect.Configuration;
+using LLMAutocorrect.Correction;
+using LLMAutocorrect.Input;
+using LLMAutocorrect.Models;
+using LLMAutocorrect.Memory;
+using LLMAutocorrect.Security;
+using LLMAutocorrect.UI;
+using LLMAutocorrect.Windows;
+using Forms = System.Windows.Forms;
+using System.Runtime.InteropServices;
+using System.IO.Compression;
+
+if (args.Contains("--sendinput-smoke", StringComparer.Ordinal))
+    return RunSendInputSmoke();
+if (args.Contains("--layout", StringComparer.Ordinal))
+{
+    Console.WriteLine($"INPUT size={System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.Input>()} keyboardOffset={System.Runtime.InteropServices.Marshal.OffsetOf<NativeMethods.Input>(nameof(NativeMethods.Input.Keyboard))}");
+    Console.WriteLine($"KEYBDINPUT size={System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.KeybdInput>()} extraOffset={System.Runtime.InteropServices.Marshal.OffsetOf<NativeMethods.KeybdInput>(nameof(NativeMethods.KeybdInput.ExtraInfo))}");
+    Console.WriteLine($"MOUSEINPUT size={System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.MouseInput>()}");
+    return 0;
+}
+if (args.Contains("--editor-message-smoke", StringComparer.Ordinal))
+    return RunEditorMessageSmoke();
+if (args.Contains("--uia-replacement-smoke", StringComparer.Ordinal))
+    return RunUiaReplacementSmoke();
+
+var tests = new (string Name, Action Run)[]
+{
+    ("minimal correction accepted", MinimalCorrectionAccepted),
+    ("protected identifier change rejected", ProtectedIdentifierRejected),
+    ("number change rejected", NumberChangeRejected),
+    ("large rewrite rejected", LargeRewriteRejected),
+    ("repeated correction rejected", RepeatedCorrectionRejected),
+    ("suggestion spacing normalized", SuggestionSpacing),
+    ("duplicate prefix removed", DuplicatePrefix),
+    ("invented number rejected", InventedNumberRejected),
+    ("repeated suggestion rejected", RepeatedSuggestionRejected),
+    ("sensitive topic detected", SensitiveTopic),
+    ("browser address bar detected", BrowserAddressBarDetected),
+    ("address bar style preserved", AddressBarStylePreserved),
+    ("manual correction permits ordinary punctuation", ManualCorrectionPermitsOrdinaryPunctuation),
+    ("manual correction popup avoids the pointer menu", ManualCorrectionPopupAvoidsPointerMenu),
+    ("terminal context identifies shells and command lines", TerminalContextIdentifiesShellsAndLines),
+    ("terminal suggestions append safely", TerminalSuggestionsAppendSafely),
+    ("terminal history ranks frequent matching commands", TerminalHistoryRanksFrequentMatches),
+    ("terminal processes never receive prose autocorrect", TerminalProcessesNeverReceiveAutocorrect),
+    ("terminal defaults provide ten suggestions", TerminalDefaultsProvideTenSuggestions),
+    ("terminal completion is independent from regular autocorrect", TerminalCompletionIsIndependent),
+    ("Flash-Lite is the default model", FlashLiteIsDefaultModel),
+    ("autocomplete dictionary terms require context", DictionaryTermsRequireContext),
+    ("personal memory learns without storing prefixes", PersonalMemoryLearnsSafely),
+    ("spelling history ranks words and keeps variants", SpellingHistoryRanksVariants),
+    ("autocomplete modifiers do not count as edits", AutocompleteModifiersAreNotEdits),
+    ("stale buffer replacement rejected", StaleBufferReplacement),
+    ("navigation invalidates buffer", NavigationInvalidates)
+    ,("native replacement message plan", NativeReplacementMessagePlan)
+    ,("enter correction preserves newline", EnterCorrectionPreservesNewline)
+    ,("correction preserves trailing typing spaces", CorrectionPreservesTrailingSpaces)
+    ,("backspace updates known suffix", BackspaceUpdatesKnownSuffix)
+    ,("typing after backspace remains correctable", TypingAfterBackspaceRemainsCorrectable)
+    ,("modified backspace invalidates suffix", ModifiedBackspaceInvalidatesSuffix)
+    ,("enter then backspace cancels stale line correction", EnterThenBackspaceCancelsLineCorrection)
+    ,("simulated replacement is exact", SimulatedReplacementIsExact)
+    ,("1000 mixed Enter and Backspace sequences stay stale-safe", MixedEnterBackspaceStress)
+};
+
+var failures = 0;
+foreach (var test in tests)
+{
+    try { test.Run(); Console.WriteLine($"PASS {test.Name}"); }
+    catch (Exception ex) { failures++; Console.Error.WriteLine($"FAIL {test.Name}: {ex.Message}"); }
+}
+Console.WriteLine($"{tests.Length - failures}/{tests.Length} tests passed");
+return failures == 0 ? 0 : 1;
+
+static void MinimalCorrectionAccepted()
+{
+    var (validator, detector) = CorrectionTools();
+    var text = "the VFD dose not work";
+    var request = new CorrectionRequest("", text, ["VFD"], detector.Detect(text, ["VFD"]), CorrectionMode.Conservative);
+    Assert(validator.Validate(request, new(true, "The VFD does not work.", "spelling_grammar"), .4).IsValid);
+}
+
+static void ProtectedIdentifierRejected()
+{
+    var (validator, detector) = CorrectionTools();
+    var text = "serverDataScreenGetList dose not work";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative);
+    Assert(!validator.Validate(request, new(true, "The server data screen does not work.", "clarity"), 1).IsValid);
+}
+
+static void NumberChangeRejected()
+{
+    var (validator, detector) = CorrectionTools();
+    var text = "set it to 9600 bod";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative);
+    Assert(!validator.Validate(request, new(true, "Set it to 19200 baud.", "spelling"), 1).IsValid);
+}
+
+static void LargeRewriteRejected()
+{
+    var (validator, detector) = CorrectionTools();
+    var text = "the motor dose not work";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative);
+    Assert(!validator.Validate(request, new(true, "Communication with the drive has failed completely.", "clarity"), .4).IsValid);
+}
+
+static void RepeatedCorrectionRejected()
+{
+    var (validator, detector) = CorrectionTools();
+    var text = "lets test";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative);
+    Assert(!validator.Validate(request, new(true, "Let's tttt", "spelling"), 1).IsValid);
+}
+
+static void SuggestionSpacing()
+{
+    var value = new SuggestionValidator().Normalize("I installed the VFD", "but it still fails.", 100);
+    Equal(" but it still fails.", value);
+    Equal(", but it still fails.", new SuggestionValidator().Normalize("I installed the VFD", ", but it still fails.", 100));
+}
+
+static void DuplicatePrefix()
+{
+    var value = new SuggestionValidator().Normalize("I think the problem is the", "the baud rate.", 100);
+    Equal(" baud rate.", value);
+}
+
+static void InventedNumberRejected() => Assert(new SuggestionValidator().Normalize("The current is", "47.3 amps.", 100) is null);
+static void RepeatedSuggestionRejected() => Assert(new SuggestionValidator().Normalize("This is a test", "......................", 100) is null);
+static void SensitiveTopic() => Assert(new SensitiveContentDetector().ContainsSensitiveTopic("my API key is"));
+
+static void BrowserAddressBarDetected()
+{
+    var address = new FocusedControlIdentity("1.2", false, true, "Address and search bar", "address and search bar", "OmniboxViewViews");
+    Assert(address.IsBrowserAddressBar("brave.exe"));
+    Assert(!address.IsBrowserAddressBar("notepad.exe"));
+    var pageField = new FocusedControlIdentity("1.3", false, true, "Search", "search-box", "TextField");
+    Assert(!pageField.IsBrowserAddressBar("brave.exe"));
+}
+
+static void AddressBarStylePreserved()
+{
+    var (validator, detector) = CorrectionTools();
+    const string text = "now lets missspess";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative,
+        "", PreserveCapitalizationAndPunctuation: true);
+    Assert(validator.Validate(request, new(true, "now lets misspell", "spelling"), .4).IsValid);
+    Assert(!validator.Validate(request, new(true, "Now let's misspell.", "spelling_grammar"), .4).IsValid);
+}
+
+static void ManualCorrectionPermitsOrdinaryPunctuation()
+{
+    var settings = new AppSettings { BrowserAddressBarSpellingOnly = true };
+    var notepad = new FocusedControlIdentity("1.4", false, true, "Text editor", "Text Editor", "RichEditD2DPT");
+    Assert(!ManualCorrectionService.ShouldPreserveAddressBarStyle(settings, notepad, "notepad.exe"));
+
+    var (validator, detector) = CorrectionTools();
+    const string text = "havent typped";
+    var standardRequest = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative,
+        "", PreserveCapitalizationAndPunctuation: false);
+    var correction = new CorrectionResult(true, "haven't typed", "spelling_grammar");
+    Assert(validator.Validate(standardRequest, correction, .60).IsValid);
+
+    var addressBar = new FocusedControlIdentity("1.5", false, true, "Address and search bar", "address", "OmniboxViewViews");
+    Assert(ManualCorrectionService.ShouldPreserveAddressBarStyle(settings, addressBar, "brave.exe"));
+    var addressRequest = standardRequest with { PreserveCapitalizationAndPunctuation = true };
+    Equal("address-bar-style", validator.Validate(addressRequest, correction, .60).Reason);
+    Equal("Not corrected because address-bar spelling mode preserves capitalization and punctuation.",
+        ManualCorrectionService.ValidationMessage("address-bar-style"));
+}
+
+static void ManualCorrectionPopupAvoidsPointerMenu()
+{
+    var work = new System.Windows.Rect(0, 0, 1920, 1080);
+    var popup = new System.Windows.Size(300, 80);
+    var center = ManualCorrectionOverlay.CalculatePosition(new System.Windows.Point(900, 500), work, popup, 16);
+    Equal(584d, center.X);
+    Equal(404d, center.Y);
+
+    var corner = ManualCorrectionOverlay.CalculatePosition(new System.Windows.Point(8, 8), work, popup, 16);
+    Equal(24d, corner.X);
+    Equal(24d, corner.Y);
+
+    var bottomRight = ManualCorrectionOverlay.CalculatePosition(new System.Windows.Point(1910, 1070), work, popup, 16);
+    Equal(1594d, bottomRight.X);
+    Equal(974d, bottomRight.Y);
+}
+
+static void TerminalContextIdentifiesShellsAndLines()
+{
+    string[] processes = ["cmd.exe", "powershell.exe", "pwsh.exe", "WindowsTerminal.exe"];
+    Assert(TerminalContext.IsTerminalProcess("PWSH.EXE", processes));
+    Assert(!TerminalContext.IsTerminalProcess("notepad.exe", processes));
+    Equal("powershell", TerminalContext.DetectShell("WindowsTerminal.exe", "Administrator: PowerShell"));
+    Equal("cmd", TerminalContext.DetectShell("cmd.exe", "Command Prompt"));
+    Equal("Get-Ch", TerminalContext.CurrentLine("Get-Location\nGet-Ch"));
+    Equal("Get-ChildItem", TerminalContext.LastCompletedCommand("Get-Location\nGet-ChildItem\n"));
+    Equal(2, TerminalContext.RecentSessionCommands("Get-Location\nGet-ChildItem\n", 10).Count);
+}
+
+static void TerminalSuggestionsAppendSafely()
+{
+    var validator = new TerminalSuggestionValidator();
+    Equal("ildItem -Force", validator.Normalize("Get-Ch", "Get-ChildItem -Force"));
+    Equal("tatus", validator.Normalize("git s", "status"));
+    Assert(validator.Normalize("Remove-Item ", "Remove-Item C:\\ -Recurse -Force") is null);
+    Assert(!validator.IsSafeContext("curl example.test -H Authorization:secret-value"));
+    Assert(!validator.IsSafeHistoryEntry("shutdown /s /t 0"));
+}
+
+static void TerminalHistoryRanksFrequentMatches()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-command-history-{Guid.NewGuid():N}.json");
+    try
+    {
+        var settings = new SettingsManager();
+        settings.Current.TerminalUsePowerShellHistory = false;
+        settings.Current.TerminalRememberCommands = true;
+        var validator = new TerminalSuggestionValidator();
+        var history = new CommandHistoryStore(settings, validator, path);
+        history.RecordAsync("git status", "cmd").GetAwaiter().GetResult();
+        history.RecordAsync("git stash list", "cmd").GetAwaiter().GetResult();
+        history.RecordAsync("git status", "cmd").GetAwaiter().GetResult();
+        history.RecordAsync("set API_KEY=secret-value", "cmd").GetAwaiter().GetResult();
+        var matches = history.GetMatchingCommands("cmd", "git s", 10);
+        Equal(2, matches.Count);
+        Equal("git status", matches[0]);
+        Equal(2, history.Count);
+        history.ClearAsync().GetAwaiter().GetResult();
+        Assert(!File.Exists(path));
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+}
+
+static void TerminalProcessesNeverReceiveAutocorrect()
+{
+    var settings = new SettingsManager();
+    settings.Current.ExcludedProcesses.Clear();
+    var exclusions = new ApplicationExclusionManager(settings);
+    Assert(!exclusions.IsAutocorrectAllowed("powershell.exe"));
+    Assert(!exclusions.IsAutocorrectAllowed("WindowsTerminal.exe"));
+    Assert(exclusions.IsAutocorrectAllowed("notepad.exe"));
+}
+
+static void TerminalDefaultsProvideTenSuggestions()
+{
+    var settings = new AppSettings();
+    Assert(settings.TerminalAutocompleteEnabled);
+    Equal(10, settings.TerminalAutocompleteCandidates);
+    Assert(settings.TerminalProcesses.Contains("pwsh.exe", StringComparer.OrdinalIgnoreCase));
+}
+
+static void TerminalCompletionIsIndependent()
+{
+    var settings = new AppSettings
+    {
+        Enabled = false,
+        AutocompleteEnabled = false,
+        TerminalAutocompleteEnabled = true,
+        TerminalMinimumCharacters = 1
+    };
+    Assert(AutocompleteCoordinator.FeatureEnabled(settings, true));
+    Assert(!AutocompleteCoordinator.FeatureEnabled(settings, false));
+    Equal(1, settings.TerminalMinimumCharacters);
+
+    settings.Enabled = true;
+    settings.TerminalAutocompleteEnabled = false;
+    Assert(!AutocompleteCoordinator.FeatureEnabled(settings, true));
+}
+
+static void FlashLiteIsDefaultModel() => Equal("gemini-3.5-flash-lite", new AppSettings().GeminiModel);
+
+static void DictionaryTermsRequireContext()
+{
+    string[] terms = ["Modbus", "VFD", "Brave"];
+    Equal(0, AutocompleteCoordinator.RelevantTechnicalTerms("please help write this message", terms).Count);
+    var relevant = AutocompleteCoordinator.RelevantTechnicalTerms("check the modbus settings", terms);
+    Equal(1, relevant.Count);
+    Equal("Modbus", relevant[0]);
+}
+
+static void PersonalMemoryLearnsSafely()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-memory-{Guid.NewGuid():N}.json");
+    try
+    {
+        var settings = new SettingsManager();
+        var memory = new WritingMemory(settings, path);
+        memory.RecordAcceptedAsync("can you give me", "the full code").GetAwaiter().GetResult();
+        Assert(memory.RecallPhrases("can you give me", 3).Contains("the full code"));
+        var serialized = File.ReadAllText(path);
+        Assert(!serialized.Contains("can you give me", StringComparison.OrdinalIgnoreCase));
+
+        var reloaded = new WritingMemory(settings, path);
+        reloaded.LoadAsync().GetAwaiter().GetResult();
+        Assert(reloaded.RecallPhrases("can you give me", 3).Contains("the full code"));
+        Assert(reloaded.RecallPhrases("please check something else", 3).Count == 0);
+
+        reloaded.RecordCorrectionAsync("teh adress is wrong", "the address is wrong", []).GetAwaiter().GetResult();
+        Assert(reloaded.GetSpellingHints("teh adress").Count == 0);
+        reloaded.RecordCorrectionAsync("teh adress is wrong", "the address is wrong", []).GetAwaiter().GetResult();
+        var hints = reloaded.GetSpellingHints("teh adress");
+        Assert(hints.Contains("teh -> the"));
+        Assert(hints.Contains("adress -> address"));
+        reloaded.ClearAsync().GetAwaiter().GetResult();
+        Assert(!File.Exists(path));
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+        if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp");
+    }
+}
+
+static void SpellingHistoryRanksVariants()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-history-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var store = Path.Combine(directory, "history.json");
+    var workbook = Path.Combine(directory, "history.xlsx");
+    try
+    {
+        var settings = new SettingsManager();
+        var history = new SpellingHistory(settings, store, workbook);
+        history.LoadAsync().GetAwaiter().GetResult();
+        history.RecordCorrectionAsync("a mistkae", "a mistake", []).GetAwaiter().GetResult();
+        history.RecordCorrectionAsync("another mistkae", "another mistake", []).GetAwaiter().GetResult();
+        history.RecordCorrectionAsync("one mistke", "one mistake", []).GetAwaiter().GetResult();
+        history.RecordCorrectionAsync("bad adress", "bad address", []).GetAwaiter().GetResult();
+        Equal(2, history.CorrectWordCount);
+        Assert(File.Exists(workbook));
+        using var archive = ZipFile.OpenRead(workbook);
+        Assert(archive.GetEntry("xl/worksheets/sheet1.xml") is not null);
+        using var reader = new StreamReader(archive.GetEntry("xl/worksheets/sheet1.xml")!.Open());
+        var sheet = reader.ReadToEnd();
+        Assert(sheet.Contains("mistake", StringComparison.Ordinal));
+        Assert(sheet.Contains("mistkae (2); mistke (1)", StringComparison.Ordinal));
+        Assert(sheet.Contains("address", StringComparison.Ordinal));
+        Assert(sheet.IndexOf("mistake", StringComparison.Ordinal) < sheet.IndexOf("address", StringComparison.Ordinal));
+        var saved = File.ReadAllText(store);
+        Assert(!saved.Contains("another mistkae", StringComparison.Ordinal));
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, true);
+    }
+}
+
+static void AutocompleteModifiersAreNotEdits()
+{
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkMenu));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkControl));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkShift));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkLeftMenu));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkRightMenu));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkLeftControl));
+    Assert(GlobalKeyboardHook.IsModifierKey(NativeMethods.VkRightControl));
+    Assert(!GlobalKeyboardHook.IsModifierKey(NativeMethods.VkDown));
+    Assert(!GlobalKeyboardHook.IsModifierKey(NativeMethods.VkRight));
+    var now = DateTimeOffset.UtcNow;
+    Equal(AutocompleteKeyAction.IgnoreModifier,
+        AutocompleteCoordinator.ClassifyKey(new(1, NativeMethods.VkMenu, null, false, true, false, now)));
+    Equal(AutocompleteKeyAction.Cycle,
+        AutocompleteCoordinator.ClassifyKey(new(1, NativeMethods.VkDown, null, false, true, false, now)));
+    Equal(AutocompleteKeyAction.IgnoreModifier,
+        AutocompleteCoordinator.ClassifyKey(new(1, NativeMethods.VkControl, null, true, false, false, now)));
+    Equal(AutocompleteKeyAction.AcceptNextWord,
+        AutocompleteCoordinator.ClassifyKey(new(1, NativeMethods.VkRight, null, true, false, false, now)));
+}
+
+static void StaleBufferReplacement()
+{
+    var buffer = new TypingBuffer();
+    var window = new WindowIdentity(new IntPtr(1), 2, "notepad.exe", "note");
+    buffer.Handle(new(1, 0x41, 'a', false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(!buffer.TryReplaceSuffix(0, "a", "b", 2));
+    Assert(buffer.TryReplaceSuffix(1, "a", "b", 2));
+    Equal("b", buffer.GetSnapshot().BufferText);
+}
+
+static void NavigationInvalidates()
+{
+    var buffer = new TypingBuffer();
+    var window = new WindowIdentity(new IntPtr(1), 2, "notepad.exe", "note");
+    buffer.Handle(new(1, 0x41, 'a', false, false, false, DateTimeOffset.UtcNow), window);
+    var result = buffer.Handle(new(2, 0x25, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(!result.Snapshot.IsSynchronized && result.Snapshot.BufferText.Length == 0);
+}
+
+static void NativeReplacementMessagePlan()
+{
+    var plan = SendInputService.BuildMessagePlan(3, true);
+    Equal(4, plan.Count);
+    Assert(plan.Take(3).All(x => x == NativeMethods.WmChar));
+    Equal((uint)NativeMethods.WmPaste, plan[3]);
+    var deletion = SendInputService.BuildDeletionInputs(3);
+    Equal(6, deletion.Length);
+    Assert(deletion.All(x => x.Keyboard.VirtualKey == 0x08));
+}
+
+static void EnterCorrectionPreservesNewline()
+{
+    var extracted = CorrectionCoordinator.ExtractTarget("this is s test\n", 300, 500);
+    Equal("this is s test", extracted.Target);
+    Equal("\n", extracted.Trailing);
+    Equal("This is a test.\n", "This is a test." + extracted.Trailing);
+}
+
+static void CorrectionPreservesTrailingSpaces()
+{
+    var extracted = CorrectionCoordinator.ExtractTarget("this needs corection  ", 300, 500);
+    Equal("this needs corection", extracted.Target);
+    Equal("  ", extracted.Trailing);
+    Equal("this needs correction  ", "this needs correction" + extracted.Trailing);
+
+    var withEnter = CorrectionCoordinator.ExtractTarget("havent typped \n", 300, 500);
+    Equal("havent typped", withEnter.Target);
+    Equal(" \n", withEnter.Trailing);
+}
+
+static void BackspaceUpdatesKnownSuffix()
+{
+    var buffer = NewBufferWithText("this is s test", out var window, out var version);
+    var change = buffer.Handle(new(++version, 0x08, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(change.Snapshot.IsSynchronized);
+    Equal("this is s tes", change.Snapshot.BufferText);
+    Assert(!buffer.TryReplaceSuffix(version - 1, "this is s test", "This is a test.", version + 1));
+}
+
+static void TypingAfterBackspaceRemainsCorrectable()
+{
+    var buffer = NewBufferWithText("now lets missspess", out var window, out var version);
+    for (var i = 0; i < 5; i++)
+        buffer.Handle(new(++version, NativeMethods.VkBack, null, false, false, false, DateTimeOffset.UtcNow), window);
+    foreach (var character in "pell")
+        buffer.Handle(new(++version, char.ToUpperInvariant(character), character, false, false, false, DateTimeOffset.UtcNow), window);
+
+    var snapshot = buffer.GetSnapshot();
+    Assert(snapshot.IsSynchronized);
+    Equal("now lets misspell", snapshot.BufferText);
+    Assert(buffer.TryReplaceSuffix(snapshot.BufferVersion, "now lets misspell", "Now let's misspell.", ++version));
+}
+
+static void ModifiedBackspaceInvalidatesSuffix()
+{
+    var buffer = NewBufferWithText("known suffix", out var window, out var version);
+    var change = buffer.Handle(new(++version, NativeMethods.VkBack, null, true, false, false, DateTimeOffset.UtcNow), window);
+    Assert(!change.Snapshot.IsSynchronized);
+    Equal(string.Empty, change.Snapshot.BufferText);
+}
+
+static void EnterThenBackspaceCancelsLineCorrection()
+{
+    var buffer = NewBufferWithText("i just hit enter", out var window, out var version);
+    var entered = buffer.Handle(new(++version, 0x0D, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(entered.ShouldTriggerImmediately);
+    Equal("\n", CorrectionCoordinator.ExtractTarget(entered.Snapshot.BufferText, 300, 500).Trailing);
+    var erased = buffer.Handle(new(++version, 0x08, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(erased.Snapshot.IsSynchronized);
+    Equal("i just hit enter", erased.Snapshot.BufferText);
+    Assert(!buffer.TryReplaceSuffix(version - 1, "i just hit enter\n", "I just hit Enter.\n", version + 1));
+}
+
+static void SimulatedReplacementIsExact()
+{
+    const string input = "this is a new test";
+    const string replacement = "This is a new test.";
+    var simulatedEditor = input;
+    simulatedEditor = simulatedEditor[..^input.Length] + replacement;
+    Equal(replacement, simulatedEditor);
+}
+
+static TypingBuffer NewBufferWithText(string text, out WindowIdentity window, out long version)
+{
+    var buffer = new TypingBuffer();
+    window = new WindowIdentity(new IntPtr(1), 2, "notepad.exe", "note");
+    version = 0;
+    foreach (var character in text)
+        buffer.Handle(new(++version, char.ToUpperInvariant(character), character, false, false, false, DateTimeOffset.UtcNow), window);
+    return buffer;
+}
+
+static void MixedEnterBackspaceStress()
+{
+    var random = new Random(29092026);
+    for (var iteration = 0; iteration < 1000; iteration++)
+    {
+        var wordCount = random.Next(2, 9);
+        var text = string.Join(' ', Enumerable.Range(0, wordCount).Select(i => $"word{i}"));
+        var buffer = NewBufferWithText(text, out var window, out var version);
+        var pending = buffer.GetSnapshot();
+
+        if ((iteration & 1) == 0)
+        {
+            var entered = buffer.Handle(new(++version, 0x0D, null, false, false, false, DateTimeOffset.UtcNow), window);
+            var target = CorrectionCoordinator.ExtractTarget(entered.Snapshot.BufferText, 300, 500);
+            Equal("\n", target.Trailing);
+            Equal(text, target.Target);
+        }
+
+        var erased = buffer.Handle(new(++version, 0x08, null, false, false, false, DateTimeOffset.UtcNow), window);
+        Assert(erased.Snapshot.IsSynchronized);
+        Assert(!buffer.TryReplaceSuffix(pending.BufferVersion, text, "stale replacement", version + 1));
+
+        var next = (char)('a' + random.Next(0, 26));
+        var resumed = buffer.Handle(new(++version, char.ToUpperInvariant(next), next, false, false, false, DateTimeOffset.UtcNow), window);
+        Assert(resumed.Snapshot.IsSynchronized);
+        Equal(((iteration & 1) == 0 ? text : text[..^1]) + next, resumed.Snapshot.BufferText);
+    }
+}
+
+static (CorrectionValidator, ProtectedTokenDetector) CorrectionTools()
+{
+    var detector = new ProtectedTokenDetector();
+    return (new CorrectionValidator(detector), detector);
+}
+
+static void Assert(bool condition)
+{
+    if (!condition) throw new InvalidOperationException("assertion failed");
+}
+
+static void Equal<T>(T expected, T actual)
+{
+    if (!EqualityComparer<T>.Default.Equals(expected, actual))
+        throw new InvalidOperationException($"expected '{expected}', got '{actual}'");
+}
+
+static int RunSendInputSmoke()
+{
+    const string original = "This is a new not pad";
+    const string corrected = "This is a new notepad.";
+    var expected = corrected + "\n";
+    string? actual = null;
+    Exception? failure = null;
+    using var completed = new ManualResetEventSlim();
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var form = new Forms.Form
+            {
+                Text = "LLMAutocorrect SendInput Test",
+                Width = 520,
+                Height = 120,
+                TopMost = true,
+                ShowInTaskbar = false,
+                StartPosition = Forms.FormStartPosition.CenterScreen
+            };
+            using var textBox = new Forms.TextBox
+            {
+                Dock = Forms.DockStyle.Fill,
+                Text = original,
+                Font = new System.Drawing.Font("Segoe UI", 14),
+                Multiline = true,
+                AcceptsReturn = true
+            };
+            form.Controls.Add(textBox);
+            form.Shown += async (_, _) =>
+            {
+                try
+                {
+                    form.Activate();
+                    textBox.Focus();
+                    textBox.SelectionStart = textBox.TextLength;
+                    var oldForeground = TestNative.GetForegroundWindow();
+                    var foregroundThread = TestNative.GetWindowThreadProcessId(oldForeground, out _);
+                    var currentThread = TestNative.GetCurrentThreadId();
+                    var attached = foregroundThread != currentThread && TestNative.AttachThreadInput(currentThread, foregroundThread, true);
+                    TestNative.KeybdEvent(0x12, 0, 0, UIntPtr.Zero);
+                    TestNative.KeybdEvent(0x12, 0, 0x0002, UIntPtr.Zero);
+                    TestNative.ShowWindow(form.Handle, 5);
+                    TestNative.BringWindowToTop(form.Handle);
+                    TestNative.SetForegroundWindow(form.Handle);
+                    TestNative.SetFocus(textBox.Handle);
+                    if (attached) TestNative.AttachThreadInput(currentThread, foregroundThread, false);
+                    form.Activate();
+                    textBox.Focus();
+                    TestNative.SetFocus(textBox.Handle);
+                    await Task.Delay(250);
+                    if (TestNative.GetForegroundWindow() != form.Handle)
+                        throw new InvalidOperationException("Test window could not acquire foreground focus.");
+                    if (!textBox.ContainsFocus)
+                        throw new InvalidOperationException("Test text box could not acquire keyboard focus.");
+
+                    // Exercise the actual Windows Enter and Backspace key paths before
+                    // correcting the line. This catches the stale-buffer/caret failures
+                    // that pure string simulations cannot reproduce.
+                    if (!SendInputService.SendVirtualKeyPair(NativeMethods.VkReturn))
+                        throw new InvalidOperationException("Could not send Enter.");
+                    await Task.Delay(100);
+                    Equal(original + "\n", NormalizeForSmoke(textBox.Text));
+                    if (!SendInputService.SendVirtualKeyPair(NativeMethods.VkBack))
+                        throw new InvalidOperationException("Could not send Backspace.");
+                    await Task.Delay(100);
+                    Equal(original, NormalizeForSmoke(textBox.Text));
+                    if (!SendInputService.SendVirtualKeyPair(NativeMethods.VkReturn))
+                        throw new InvalidOperationException("Could not send the final Enter.");
+                    await Task.Delay(100);
+
+                    if (!new SendInputService().ReplacePreviousText(original + "\n", corrected + "\n"))
+                        throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(), "SendInput reported failure.");
+                    await Task.Delay(500);
+                    actual = NormalizeForSmoke(textBox.Text);
+                }
+                catch (Exception ex) { failure = ex; }
+                finally { form.Close(); }
+            };
+            Forms.Application.Run(form);
+        }
+        catch (Exception ex) { failure = ex; }
+        finally { completed.Set(); }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    if (!completed.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("SendInput smoke test timed out.");
+    thread.Join();
+    if (failure is not null) throw failure;
+    if (!string.Equals(expected, actual, StringComparison.Ordinal))
+    {
+        Console.Error.WriteLine($"SENDINPUT_FAIL expected={ToCodePoints(expected)} actual={ToCodePoints(actual ?? string.Empty)}");
+        return 1;
+    }
+    Console.WriteLine($"SENDINPUT_PASS physical Enter, Backspace, Enter, and exact replacement value={ToCodePoints(actual ?? string.Empty)}");
+    return 0;
+}
+
+static string ToCodePoints(string value) => string.Join(' ', value.Select(c => $"U+{(int)c:X4}"));
+static string NormalizeForSmoke(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
+static int RunEditorMessageSmoke()
+{
+    Exception? failure = null;
+    using var completed = new ManualResetEventSlim();
+    var thread = new Thread(() =>
+    {
+        Forms.IDataObject? previous = null;
+        try
+        {
+            previous = Forms.Clipboard.GetDataObject();
+            RunCase("this is s test", "This is a test.", false);
+            RunCase("i just hit enter", "I just hit Enter.", true);
+
+            using var backspaceBox = new Forms.TextBox { Text = "abc" };
+            _ = backspaceBox.Handle;
+            backspaceBox.SelectionStart = backspaceBox.TextLength;
+            Assert(SendInputService.SendBackspaces(backspaceBox.Handle, 1));
+            Equal("ab", backspaceBox.Text);
+        }
+        catch (Exception ex) { failure = ex; }
+        finally
+        {
+            try
+            {
+                if (previous is null) Forms.Clipboard.Clear();
+                else Forms.Clipboard.SetDataObject(previous, true);
+            }
+            catch { }
+            completed.Set();
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    if (!completed.Wait(TimeSpan.FromSeconds(15))) throw new TimeoutException("Editor message smoke test timed out.");
+    thread.Join();
+    if (failure is not null) throw failure;
+    Console.WriteLine("EDITOR_MESSAGE_PASS standard replacement, Enter preservation, and Backspace deletion");
+    return 0;
+
+    static void RunCase(string input, string replacement, bool pressEnter)
+    {
+        using var textBox = new Forms.TextBox { Multiline = true, Text = input };
+        _ = textBox.Handle;
+        textBox.SelectionStart = textBox.TextLength;
+        var trailing = string.Empty;
+        if (pressEnter)
+        {
+            Assert(SendInputService.SendEnter(textBox.Handle));
+            trailing = "\n";
+        }
+        Forms.Clipboard.SetText(replacement + trailing);
+        var deleteCount = input.Length + (pressEnter ? 1 : 0);
+        Assert(SendInputService.SendEditSequence(textBox.Handle, deleteCount));
+        Equal(NormalizeNewlines(replacement + trailing), NormalizeNewlines(textBox.Text));
+    }
+
+    static string NormalizeNewlines(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal);
+}
+
+static int RunUiaReplacementSmoke()
+{
+    Exception? failure = null;
+    using var ready = new ManualResetEventSlim();
+    Forms.Form? form = null;
+    Forms.TextBox? valueBox = null;
+    Forms.RichTextBox? richBox = null;
+    var uiThread = new Thread(() =>
+    {
+        try
+        {
+            form = new Forms.Form { ShowInTaskbar = false, Left = 100, Top = 100, Width = 300, Height = 180 };
+            valueBox = new Forms.TextBox { Text = "this is s test", Dock = Forms.DockStyle.Top };
+            richBox = new Forms.RichTextBox { Text = "i just hit enter" + Environment.NewLine, Dock = Forms.DockStyle.Fill };
+            form.Controls.Add(richBox);
+            form.Controls.Add(valueBox);
+            form.Shown += (_, _) => ready.Set();
+            Forms.Application.Run(form);
+        }
+        catch (Exception ex) { failure = ex; ready.Set(); }
+    });
+    uiThread.SetApartmentState(ApartmentState.STA);
+    uiThread.Start();
+    if (!ready.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("UI Automation test controls did not start.");
+    if (failure is not null) throw failure;
+
+    var automationThread = new Thread(() =>
+    {
+        try
+        {
+            if (form is null || valueBox is null || richBox is null) throw new InvalidOperationException("Test controls unavailable.");
+            form.Invoke(() =>
+            {
+                valueBox.SelectionStart = valueBox.TextLength;
+                richBox.SelectionStart = richBox.TextLength;
+            });
+            var valueHandle = (IntPtr)form.Invoke(new Func<IntPtr>(() => valueBox.Handle));
+            var richHandle = (IntPtr)form.Invoke(new Func<IntPtr>(() => richBox.Handle));
+            var valueElement = System.Windows.Automation.AutomationElement.FromHandle(valueHandle);
+            if (!SendInputService.ReplaceForElement(valueElement, "this is s test", "This is a test."))
+                throw new InvalidOperationException($"ValuePattern replacement failed; patterns={PatternNames(valueElement)}");
+            var actualValue = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("This is a test.", actualValue);
+            var valueCaret = (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart));
+            Equal(actualValue.Length, valueCaret);
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "did it get slower then befor";
+                valueBox.SelectionStart = valueBox.TextLength;
+            });
+            if (!SendInputService.ReplaceForElement(valueElement,
+                    "did it get slower then befor", "did it get slower than before"))
+                throw new InvalidOperationException("Exact non-duplicating replacement failed.");
+            var exactReplacement = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("did it get slower than before", exactReplacement);
+            Assert(!exactReplacement.Contains("befordid", StringComparison.Ordinal));
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "now lets missspess";
+                valueBox.SelectionStart = valueBox.TextLength;
+            });
+            Assert(SendInputService.SendBackspaces(valueHandle, 5));
+            form.Invoke(() => valueBox.AppendText("pell"));
+            var afterBackspace = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("now lets misspell", afterBackspace);
+            if (!SendInputService.ReplaceForElement(valueElement, "now lets misspell", "Now let's misspell."))
+                throw new InvalidOperationException("Replacement after Backspace failed.");
+            var correctedAfterBackspace = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("Now let's misspell.", correctedAfterBackspace);
+            var correctedCaret = (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart));
+            Equal(correctedAfterBackspace.Length, correctedCaret);
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "this needs corection  ";
+                valueBox.SelectionStart = valueBox.TextLength;
+            });
+            if (!SendInputService.ReplaceForElement(valueElement, "this needs corection  ", "this needs correction  "))
+                throw new InvalidOperationException("Trailing-space replacement failed.");
+            var withTrailingSpaces = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("this needs correction  ", withTrailingSpaces);
+            Equal(withTrailingSpaces.Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "typing resumed";
+                valueBox.SelectionStart = valueBox.TextLength;
+            });
+            Assert(!SendInputService.ReplaceForElement(valueElement, "typing resumed", "Typing resumed.", () => false));
+            Equal("typing resumed", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal("typing resumed".Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "please fix mistkae now";
+                valueBox.SelectionStart = valueBox.TextLength;
+                valueBox.SelectionLength = 0;
+            });
+            var wordPoint = (System.Drawing.Point)form.Invoke(new Func<System.Drawing.Point>(() =>
+                valueBox.PointToScreen(valueBox.GetPositionFromCharIndex(14))));
+            var testWindow = new WindowIdentity(valueHandle, Environment.ProcessId, "test.exe", "test");
+            if (!ManualCorrectionService.TryCaptureFromElement(valueElement, testWindow,
+                    new System.Windows.Point(wordPoint.X, wordPoint.Y), out var manualTarget))
+                throw new InvalidOperationException("Right-click word targeting failed.");
+            Equal("mistkae", manualTarget.OriginalText);
+            if (!new SendInputService().ReplaceTextRange(valueElement, manualTarget.Range, manualTarget.OriginalText, "mistake"))
+            {
+                var failedValue = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+                var failedSelection = manualTarget.Range.GetText(-1);
+                throw new InvalidOperationException($"Selected-word replacement failed; value={ToCodePoints(failedValue)}; selection={ToCodePoints(failedSelection)}");
+            }
+            var selectedCorrection = (string)form.Invoke(new Func<string>(() => valueBox.Text));
+            Equal("please fix mistake now", selectedCorrection);
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "this has adress here";
+                valueBox.SelectionStart = 9;
+                valueBox.SelectionLength = 6;
+            });
+            if (!ManualCorrectionService.TryCaptureFromElement(valueElement, testWindow, null, out var selectedTarget))
+                throw new InvalidOperationException("Highlighted-text targeting failed.");
+            Equal("adress", selectedTarget.OriginalText);
+            if (!new SendInputService().ReplaceTextRange(valueElement, selectedTarget.Range, selectedTarget.OriginalText, "address"))
+                throw new InvalidOperationException("Highlighted-text replacement failed.");
+            Equal("this has address here", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+
+            var richElement = System.Windows.Automation.AutomationElement.FromHandle(richHandle);
+            if (!SendInputService.ReplaceForElement(richElement, "i just hit enter\n", "I just hit Enter.\n"))
+                throw new InvalidOperationException($"TextPattern replacement failed; patterns={PatternNames(richElement)}; {DescribeTextRange(richElement, 17)}");
+            var actualRich = (string)form.Invoke(new Func<string>(() => richBox.Text));
+            Equal("I just hit Enter.\n", actualRich.Replace("\r\n", "\n", StringComparison.Ordinal));
+            var richCaret = (int)form.Invoke(new Func<int>(() => richBox.SelectionStart));
+            var richLength = (int)form.Invoke(new Func<int>(() => richBox.TextLength));
+            Equal(richLength, richCaret);
+        }
+        catch (Exception ex) { failure = ex; }
+        finally { form?.BeginInvoke(form.Close); }
+    });
+    automationThread.SetApartmentState(ApartmentState.STA);
+    automationThread.Start();
+    if (!automationThread.Join(TimeSpan.FromSeconds(20))) throw new TimeoutException("UI Automation replacement test timed out.");
+    uiThread.Join(TimeSpan.FromSeconds(10));
+    if (failure is not null) throw failure;
+    Console.WriteLine("UIA_REPLACEMENT_PASS exact non-duplicating replacement, trailing spaces, cancelled commit, selected-word correction, caret preservation, Enter, and Backspace continuation");
+    return 0;
+
+    static string PatternNames(System.Windows.Automation.AutomationElement element) => string.Join(',',
+        element.GetSupportedPatterns().Select(pattern => pattern.ProgrammaticName));
+
+    static string DescribeTextRange(System.Windows.Automation.AutomationElement element, int count)
+    {
+        if (!element.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out var raw) ||
+            raw is not System.Windows.Automation.TextPattern pattern) return "no-text-pattern";
+        var selections = pattern.GetSelection();
+        if (selections.Length != 1) return $"selections={selections.Length}";
+        var caret = selections[0];
+        var isDegenerate = caret.CompareEndpoints(System.Windows.Automation.Text.TextPatternRangeEndpoint.Start,
+            caret, System.Windows.Automation.Text.TextPatternRangeEndpoint.End) == 0;
+        var range = caret.Clone();
+        var moved = range.MoveEndpointByUnit(System.Windows.Automation.Text.TextPatternRangeEndpoint.Start,
+            System.Windows.Automation.Text.TextUnit.Character, -count);
+        return $"degenerate={isDegenerate};moved={moved};text={ToCodePoints(range.GetText(-1))}";
+    }
+}
+
+internal static class TestNative
+{
+    [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("kernel32.dll")] internal static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool AttachThreadInput(uint first, uint second, bool attach);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] internal static extern IntPtr SetFocus(IntPtr window);
+    [DllImport("user32.dll", EntryPoint = "keybd_event")] internal static extern void KeybdEvent(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool BringWindowToTop(IntPtr window);
+}

@@ -1,0 +1,115 @@
+<Window x:Class="LLMAutocorrect.UI.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="LLM Autocorrect Settings" Width="760" Height="620"
+        WindowStartupLocation="CenterScreen">
+  <DockPanel Margin="14">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button Content="Save" Width="90" Margin="0,0,8,0" Click="Save_Click" IsDefault="True" />
+      <Button Content="Close" Width="90" Click="Close_Click" IsCancel="True" />
+    </StackPanel>
+    <TabControl>
+      <TabItem Header="General">
+        <StackPanel Margin="16">
+          <CheckBox x:Name="EnabledCheck" Content="Enable regular spelling and grammar autocorrect" Margin="0,0,0,10" />
+          <CheckBox x:Name="AutocompleteCheck" Content="Enable regular writing autocomplete" Margin="0,0,0,10" />
+          <CheckBox x:Name="ManualRightClickCheck" Content="Show spelling correction action when right-clicking text" Margin="0,0,0,10" />
+          <CheckBox x:Name="StartupCheck" Content="Start with Windows" />
+          <TextBlock Text="Correction mode" Margin="0,18,0,4" />
+          <ComboBox x:Name="CorrectionModeCombo" Width="190" HorizontalAlignment="Left" />
+          <TextBlock Margin="0,8,0,0" Foreground="Gray" TextWrapping="Wrap"
+                     Text="Conservative fixes spelling and obvious grammar with minimal wording changes. Normal may also fix clearly awkward wording. Clarity may rewrite more of a sentence while preserving its meaning." />
+        </StackPanel>
+      </TabItem>
+      <TabItem Header="AI Provider">
+        <StackPanel Margin="16">
+          <TextBlock Text="Provider" /><TextBox Text="Gemini" IsReadOnly="True" Width="260" HorizontalAlignment="Left" />
+          <TextBlock Text="Gemini model" Margin="0,12,0,4" />
+          <TextBox x:Name="ModelText" Width="300" HorizontalAlignment="Left" />
+          <TextBlock x:Name="ApiKeyStatus" Margin="0,14,0,0" TextWrapping="Wrap" />
+        </StackPanel>
+      </TabItem>
+      <TabItem Header="Correction">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="16">
+            <TextBlock Text="Idle delay (ms)" /><TextBox x:Name="IdleDelayText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Text="Maximum edit ratio (0–1)" Margin="0,12,0,0" /><TextBox x:Name="EditRatioText" Width="120" HorizontalAlignment="Left" />
+            <CheckBox x:Name="AddressBarSpellingOnlyCheck" Margin="0,18,0,0" Content="Browser address bars: spelling only (preserve capitalization and punctuation)" />
+            <CheckBox x:Name="UncertainNotificationCheck" Margin="0,10,0,0" Content="Show a small message when a correction is uncertain or rejected for safety" />
+            <CheckBox x:Name="SuccessNotificationCheck" Margin="0,10,0,0" Content="Show a small message after a successful correction" />
+            <TextBlock Text="Custom correction instructions" Margin="0,18,0,4" />
+            <TextBox x:Name="CustomInstructionsText" Height="120" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+            <TextBlock Margin="0,6,0,0" Foreground="Gray" TextWrapping="Wrap" Text="Example: Keep my informal tone and never expand abbreviations." />
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <TabItem Header="Autocomplete">
+        <StackPanel Margin="16">
+          <TextBlock Text="Mode" /><ComboBox x:Name="AutocompleteModeCombo" Width="190" HorizontalAlignment="Left" />
+          <TextBlock Text="Delay (ms)" Margin="0,12,0,0" /><TextBox x:Name="AutocompleteDelayText" Width="120" HorizontalAlignment="Left" />
+          <TextBlock Margin="0,12,0,0" Foreground="Gray" TextWrapping="Wrap"
+                     Text="Conservative suggests only obvious short endings. Normal gives useful short completions. Aggressive suggests more often and may produce longer completions." />
+          <TextBlock Text="Tab accepts the displayed option. Alt+Down selects the next option. Esc dismisses. Ctrl+Right accepts one word." Margin="0,18,0,0" TextWrapping="Wrap" />
+        </StackPanel>
+      </TabItem>
+      <TabItem Header="Terminal">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="16">
+            <CheckBox x:Name="TerminalAutocompleteCheck" Content="Enable context-aware command completion" />
+            <TextBlock Margin="0,10,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="Uses a command-specific engine for PowerShell, Command Prompt, and Windows Terminal. Suggestions are inserted only when you press Tab; the app never presses Enter or executes a command." />
+            <TextBlock Text="Suggestion delay (ms)" Margin="0,16,0,0" />
+            <TextBox x:Name="TerminalDelayText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Text="Maximum suggestions (1-10)" Margin="0,12,0,0" />
+            <TextBox x:Name="TerminalCandidateText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Text="Minimum characters before suggesting (1-20)" Margin="0,12,0,0" />
+            <TextBox x:Name="TerminalMinimumCharactersText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Margin="0,6,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="Set this to 1 to receive suggestions after a single character. There is no minimum word count for terminal completion." />
+            <CheckBox x:Name="TerminalPowerShellHistoryCheck" Margin="0,16,0,0"
+                      Content="Use existing PowerShell PSReadLine history for ranking" />
+            <CheckBox x:Name="TerminalRememberCheck" Margin="0,10,0,0"
+                      Content="Remember commands entered while this app is running" />
+            <TextBlock Margin="0,10,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="Commands containing recognizable passwords, API keys, tokens, secrets, or high-risk destructive patterns are not stored or sent as history." />
+            <TextBlock Text="Terminal processes (comma-separated)" Margin="0,16,0,4" />
+            <TextBox x:Name="TerminalProcessesText" Height="58" TextWrapping="Wrap" AcceptsReturn="True" />
+            <TextBlock Text="Custom terminal completion instructions" Margin="0,16,0,4" />
+            <TextBox x:Name="TerminalInstructionsText" Height="80" AcceptsReturn="True"
+                     TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+            <TextBlock x:Name="TerminalHistoryStatus" Margin="0,14,0,8" TextWrapping="Wrap" />
+            <Button Content="Clear remembered command history" Width="220" HorizontalAlignment="Left"
+                    Click="ClearTerminalHistory_Click" />
+            <TextBlock Margin="0,16,0,0" TextWrapping="Wrap"
+                       Text="Tab accepts the displayed command suffix. Alt+Down cycles through as many as 10 ranked options. Esc dismisses. Ctrl+Right accepts one word." />
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <TabItem Header="Dictionary">
+        <StackPanel Margin="16"><TextBlock Text="One protected technical term per line." /><TextBlock x:Name="DictionaryPath" Margin="0,8,0,12" TextWrapping="Wrap" /><Button Content="Open dictionary" Width="140" HorizontalAlignment="Left" Click="OpenDictionary_Click" /></StackPanel>
+      </TabItem>
+      <TabItem Header="Applications">
+        <StackPanel Margin="16"><TextBlock Text="Excluded processes (comma-separated)" /><TextBox x:Name="ExcludedText" Margin="0,8,0,0" Height="90" TextWrapping="Wrap" AcceptsReturn="True" /></StackPanel>
+      </TabItem>
+      <TabItem Header="Memory">
+        <StackPanel Margin="16">
+          <CheckBox x:Name="MemoryEnabledCheck" Content="Learn from accepted autocomplete and recurring corrections" />
+          <CheckBox x:Name="SpellingHistoryEnabledCheck" Margin="0,10,0,0" Content="Record misspelled words in my spelling-history spreadsheet" />
+          <TextBlock Margin="0,14,0,0" TextWrapping="Wrap" Text="Memory stores hashed phrase prefixes, short continuations you explicitly accept, and recurring spelling pairs. It never stores complete messages or the original phrase prefix." />
+          <TextBlock x:Name="MemoryStatus" Margin="0,14,0,12" TextWrapping="Wrap" />
+          <WrapPanel>
+            <Button Content="Clear memory" Width="130" Margin="0,0,8,0" Click="ClearMemory_Click" />
+            <Button Content="Open spelling history" Width="160" Margin="0,0,8,0" Click="OpenSpellingHistory_Click" />
+            <Button Content="Clear spelling history" Width="160" Click="ClearSpellingHistory_Click" />
+          </WrapPanel>
+        </StackPanel>
+      </TabItem>
+      <TabItem Header="Privacy">
+        <StackPanel Margin="16"><CheckBox x:Name="PrivateModeCheck" Content="Private Mode (disable cloud correction and autocomplete)" /><TextBlock Margin="0,14,0,0" TextWrapping="Wrap" Text="Text is sent to Gemini only after password, application, sensitivity, and stale-context checks. Complete messages are never persisted; the Memory tab controls the small filtered entries used for personal learning." /></StackPanel>
+      </TabItem>
+      <TabItem Header="Diagnostics">
+        <StackPanel Margin="16"><TextBlock x:Name="LogPath" TextWrapping="Wrap" /><TextBlock Text="Artificial latency (ms; developer testing)" Margin="0,14,0,0" /><TextBox x:Name="LatencyText" Width="120" HorizontalAlignment="Left" /></StackPanel>
+      </TabItem>
+    </TabControl>
+  </DockPanel>
+</Window>

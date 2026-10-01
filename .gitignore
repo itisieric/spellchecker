@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.log
+.env
+.env.*
+!.env.example
+artifacts/
+.dotnet/
+.dotnet-home/
+dotnet-install.ps1
