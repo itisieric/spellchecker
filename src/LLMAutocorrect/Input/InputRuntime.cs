@@ -73,27 +73,70 @@ public sealed class InputRuntime : IAsyncDisposable
     {
         try
         {
-            await foreach (var message in _channel.Reader.ReadAllAsync(_shutdown.Token))
-            {
-                switch (message)
-                {
-                    case KeyboardMessage keyboard: ProcessKeyboard(keyboard.Input); break;
-                    case MouseMessage mouse: ProcessInvalidation(mouse.Version); break;
-                    case RightClickMessage rightClick: _manualCorrection.OfferAt(rightClick.Point); break;
-                    case ManualCorrectionMessage: _manualCorrection.OfferCurrent(); break;
-                    case UndoMessage undo: await _correction.UndoLatestAsync(undo.ExpectedVersion); break;
-                    case ToggleMessage:
-                        _settings.Current.Enabled = !_settings.Current.Enabled;
-                        await _settings.SaveAsync(_shutdown.Token);
-                        _correction.Cancel(); _autocomplete.Dismiss();
-                        break;
-                }
-            }
+            await ProcessResilientlyAsync(_channel.Reader.ReadAllAsync(), ProcessMessageAsync,
+                HandleMessageFailureAsync, _shutdown.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            await _logger.WriteAsync("InputWorkerFailed", new Dictionary<string, object?> { ["Type"] = ex.GetType().Name });
+            await TryLogAsync("InputWorkerTerminated", new Dictionary<string, object?>
+            {
+                ["Type"] = ex.GetType().Name, ["HResult"] = ex.HResult, ["Message"] = ex.Message
+            });
+        }
+    }
+
+    private async Task ProcessMessageAsync(InputMessage message)
+    {
+        switch (message)
+        {
+            case KeyboardMessage keyboard: ProcessKeyboard(keyboard.Input); break;
+            case MouseMessage mouse: ProcessInvalidation(mouse.Version); break;
+            case RightClickMessage rightClick: _manualCorrection.OfferAt(rightClick.Point); break;
+            case ManualCorrectionMessage: _manualCorrection.OfferCurrent(); break;
+            case UndoMessage undo: await _correction.UndoLatestAsync(undo.ExpectedVersion); break;
+            case ToggleMessage:
+                _settings.Current.Enabled = !_settings.Current.Enabled;
+                await _settings.SaveAsync(_shutdown.Token);
+                _correction.Cancel(); _autocomplete.Dismiss();
+                break;
+        }
+    }
+
+    private async Task HandleMessageFailureAsync(InputMessage message, Exception ex)
+    {
+        _correction.Cancel();
+        _autocomplete.Dismiss();
+        _manualCorrection.DismissOffer();
+        try { _buffer.Invalidate(_foreground.GetCurrent(), _clock.Current); } catch { }
+        await TryLogAsync("InputEventFailed", new Dictionary<string, object?>
+        {
+            ["EventType"] = message.GetType().Name,
+            ["Type"] = ex.GetType().Name,
+            ["HResult"] = ex.HResult,
+            ["Message"] = ex.Message,
+            ["Recovered"] = true
+        });
+    }
+
+    private async Task TryLogAsync(string eventName, IReadOnlyDictionary<string, object?> metadata)
+    {
+        try { await _logger.WriteAsync(eventName, metadata); } catch { }
+    }
+
+    internal static async Task ProcessResilientlyAsync<T>(IAsyncEnumerable<T> messages,
+        Func<T, Task> process, Func<T, Exception, Task> onError, CancellationToken cancellationToken)
+    {
+        await foreach (var message in messages.WithCancellation(cancellationToken))
+        {
+            try { await process(message); }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                // Diagnostics and cleanup must never become a second reason for the
+                // input loop to die. The next keyboard or mouse event must still run.
+                try { await onError(message, ex); } catch { }
+            }
         }
     }
 

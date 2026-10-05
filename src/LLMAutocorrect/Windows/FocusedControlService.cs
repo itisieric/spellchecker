@@ -23,5 +23,6 @@ public sealed class FocusedControlService
         catch (InvalidOperationException) { return new(null, false, false); }
         catch (COMException) { return new(null, false, false); }
         catch (UnauthorizedAccessException) { return new(null, false, false); }
+        catch (ArgumentException) { return new(null, false, false); }
     }
 }

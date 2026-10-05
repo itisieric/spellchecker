@@ -195,7 +195,10 @@ public sealed class CorrectionCoordinator : IDisposable
         if (!applied)
         {
             metadata["Result"] = "send-input-failed";
+            metadata["MutationDiagnostic"] = _input.LastFailureDiagnostic;
             await _logger.WriteAsync("CorrectionFailed", metadata);
+            ShowStatus(snapshot.Window.WindowHandle,
+                "The correction could not be inserted. Your text and cursor were restored.", true);
             return;
         }
 

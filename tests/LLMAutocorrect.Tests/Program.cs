@@ -40,6 +40,7 @@ var tests = new (string Name, Action Run)[]
     ("browser address bar detected", BrowserAddressBarDetected),
     ("address bar style preserved", AddressBarStylePreserved),
     ("manual correction permits ordinary punctuation", ManualCorrectionPermitsOrdinaryPunctuation),
+    ("replacement failures report the actual cause", ReplacementFailuresReportActualCause),
     ("manual correction popup avoids the pointer menu", ManualCorrectionPopupAvoidsPointerMenu),
     ("terminal context identifies shells and command lines", TerminalContextIdentifiesShellsAndLines),
     ("terminal suggestions append safely", TerminalSuggestionsAppendSafely),
@@ -54,6 +55,7 @@ var tests = new (string Name, Action Run)[]
     ("autocomplete modifiers do not count as edits", AutocompleteModifiersAreNotEdits),
     ("stale buffer replacement rejected", StaleBufferReplacement),
     ("navigation invalidates buffer", NavigationInvalidates)
+    ,("input worker survives a bad event", InputWorkerSurvivesBadEvent)
     ,("native replacement message plan", NativeReplacementMessagePlan)
     ,("enter correction preserves newline", EnterCorrectionPreservesNewline)
     ,("correction preserves trailing typing spaces", CorrectionPreservesTrailingSpaces)
@@ -169,6 +171,19 @@ static void ManualCorrectionPermitsOrdinaryPunctuation()
     Equal("address-bar-style", validator.Validate(addressRequest, correction, .60).Reason);
     Equal("Not corrected because address-bar spelling mode preserves capitalization and punctuation.",
         ManualCorrectionService.ValidationMessage("address-bar-style"));
+}
+
+static void ReplacementFailuresReportActualCause()
+{
+    var changed = ManualCorrectionService.ReplacementFailureMessage(TextReplacementResult.TextChanged);
+    var paste = ManualCorrectionService.ReplacementFailureMessage(TextReplacementResult.PasteFailed);
+    var selection = ManualCorrectionService.ReplacementFailureMessage(TextReplacementResult.SelectionUnavailable,
+        "stage=selection timeout attempts=3 focusMatch=True");
+    Assert(changed.Contains("original location", StringComparison.OrdinalIgnoreCase));
+    Assert(paste.Contains("cursor", StringComparison.OrdinalIgnoreCase));
+    Assert(selection.Contains("three attempts", StringComparison.OrdinalIgnoreCase));
+    Assert(!selection.Contains("did not allow", StringComparison.OrdinalIgnoreCase));
+    Assert(!string.Equals(changed, paste, StringComparison.Ordinal));
 }
 
 static void ManualCorrectionPopupAvoidsPointerMenu()
@@ -390,6 +405,32 @@ static void NavigationInvalidates()
     buffer.Handle(new(1, 0x41, 'a', false, false, false, DateTimeOffset.UtcNow), window);
     var result = buffer.Handle(new(2, 0x25, null, false, false, false, DateTimeOffset.UtcNow), window);
     Assert(!result.Snapshot.IsSynchronized && result.Snapshot.BufferText.Length == 0);
+}
+
+static void InputWorkerSurvivesBadEvent()
+{
+    var channel = System.Threading.Channels.Channel.CreateUnbounded<int>();
+    channel.Writer.TryWrite(1);
+    channel.Writer.TryWrite(2);
+    channel.Writer.TryWrite(3);
+    channel.Writer.TryComplete();
+    var processed = new List<int>();
+    var failures = new List<int>();
+    InputRuntime.ProcessResilientlyAsync(channel.Reader.ReadAllAsync(), value =>
+        {
+            processed.Add(value);
+            return value == 2
+                ? Task.FromException(new ArgumentException("simulated provider failure"))
+                : Task.CompletedTask;
+        },
+        (value, _) =>
+        {
+            failures.Add(value);
+            return Task.FromException(new IOException("simulated logging failure"));
+        }, CancellationToken.None)
+        .GetAwaiter().GetResult();
+    Equal("1,2,3", string.Join(',', processed));
+    Equal("2", string.Join(',', failures));
 }
 
 static void NativeReplacementMessagePlan()
@@ -752,6 +793,56 @@ static int RunUiaReplacementSmoke()
 
             form.Invoke(() =>
             {
+                valueBox.Text = "beginning";
+                valueBox.SelectionStart = 0;
+                valueBox.SelectionLength = 0;
+            });
+            Assert(SendInputService.TryMoveValueCaretToEnd(valueElement));
+            Equal("beginning".Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "beging";
+                valueBox.SelectionStart = valueBox.TextLength;
+                valueBox.SelectionLength = 0;
+            });
+            var valuePattern = (System.Windows.Automation.TextPattern)valueElement.GetCurrentPattern(
+                System.Windows.Automation.TextPattern.Pattern);
+            var originalCaretRange = valuePattern.GetSelection()[0].Clone();
+            var temporaryCorrectionRange = valuePattern.DocumentRange.Clone();
+            temporaryCorrectionRange.Select();
+            Equal("beging", temporaryCorrectionRange.GetText(-1));
+            SendInputService.RestoreSelectionAfterFailure(valuePattern, "beging", originalCaretRange);
+            Equal("beging".Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+            Equal(0, (int)form.Invoke(new Func<int>(() => valueBox.SelectionLength)));
+
+            var begingPoint = (System.Drawing.Point)form.Invoke(new Func<System.Drawing.Point>(() =>
+                valueBox.PointToScreen(valueBox.GetPositionFromCharIndex(3))));
+            var begingWindow = new WindowIdentity(valueHandle, Environment.ProcessId, "test.exe", "test");
+            if (!ManualCorrectionService.TryCaptureFromElement(valueElement, begingWindow,
+                    new System.Windows.Point(begingPoint.X, begingPoint.Y), out var begingTarget))
+                throw new InvalidOperationException("Right-click capture for 'beging' failed.");
+            Equal("beging", begingTarget.OriginalText);
+            var begingResult = new SendInputService().ReplaceTextRangeDetailed(valueElement, begingTarget.Range,
+                begingTarget.OriginalText, "beginning");
+            Equal(TextReplacementResult.Applied, begingResult);
+            Equal("beginning", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal("beginning".Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+
+            const string commentOriginal = "this is a youtube comment with a speling mistake";
+            const string commentCorrected = "this is a YouTube comment with a spelling mistake";
+            form.Invoke(() =>
+            {
+                valueBox.Text = commentOriginal;
+                valueBox.SelectionStart = 0;
+                valueBox.SelectionLength = 0;
+            });
+            Assert(SendInputService.TryReplaceWholeValue(valueElement, commentOriginal, commentCorrected));
+            Equal(commentCorrected, (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal(commentCorrected.Length, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+
+            form.Invoke(() =>
+            {
                 valueBox.Text = "now lets missspess";
                 valueBox.SelectionStart = valueBox.TextLength;
             });
@@ -799,11 +890,14 @@ static int RunUiaReplacementSmoke()
                     new System.Windows.Point(wordPoint.X, wordPoint.Y), out var manualTarget))
                 throw new InvalidOperationException("Right-click word targeting failed.");
             Equal("mistkae", manualTarget.OriginalText);
-            if (!new SendInputService().ReplaceTextRange(valueElement, manualTarget.Range, manualTarget.OriginalText, "mistake"))
+            var manualResult = new SendInputService().ReplaceTextRangeDetailed(valueElement, manualTarget.Range,
+                manualTarget.OriginalText, "mistake", out var manualDiagnostic);
+            if (manualResult != TextReplacementResult.Applied)
             {
                 var failedValue = (string)form.Invoke(new Func<string>(() => valueBox.Text));
-                var failedSelection = manualTarget.Range.GetText(-1);
-                throw new InvalidOperationException($"Selected-word replacement failed; value={ToCodePoints(failedValue)}; selection={ToCodePoints(failedSelection)}");
+                var failedSelection = ((System.Windows.Automation.TextPattern)valueElement.GetCurrentPattern(
+                    System.Windows.Automation.TextPattern.Pattern)).GetSelection()[0].GetText(-1);
+                throw new InvalidOperationException($"Selected-word replacement failed; result={manualResult}; diagnostic={manualDiagnostic}; value={ToCodePoints(failedValue)}; selection={ToCodePoints(failedSelection)}");
             }
             var selectedCorrection = (string)form.Invoke(new Func<string>(() => valueBox.Text));
             Equal("please fix mistake now", selectedCorrection);
@@ -838,7 +932,7 @@ static int RunUiaReplacementSmoke()
     if (!automationThread.Join(TimeSpan.FromSeconds(20))) throw new TimeoutException("UI Automation replacement test timed out.");
     uiThread.Join(TimeSpan.FromSeconds(10));
     if (failure is not null) throw failure;
-    Console.WriteLine("UIA_REPLACEMENT_PASS exact non-duplicating replacement, trailing spaces, cancelled commit, selected-word correction, caret preservation, Enter, and Backspace continuation");
+    Console.WriteLine("UIA_REPLACEMENT_PASS exact non-duplicating replacement, beging right-click correction, whole-comment fallback, failed-selection cleanup, caret preservation, Enter, and Backspace continuation");
     return 0;
 
     static string PatternNames(System.Windows.Automation.AutomationElement element) => string.Join(',',

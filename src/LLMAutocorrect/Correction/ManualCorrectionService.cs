@@ -79,7 +79,7 @@ public sealed partial class ManualCorrectionService
             var element = AutomationElement.FocusedElement;
             return element is not null && TryCaptureFromElement(element, window, point, out target);
         }
-        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
         {
             return false;
         }
@@ -98,7 +98,8 @@ public sealed partial class ManualCorrectionService
             TextPatternRange range;
             var selected = selection[0].GetText(-1);
             if (selection[0].CompareEndpoints(TextPatternRangeEndpoint.Start, selection[0], TextPatternRangeEndpoint.End) != 0 &&
-                !string.IsNullOrWhiteSpace(selected))
+                !string.IsNullOrWhiteSpace(selected) &&
+                (point is null || RangeContainsPoint(selection[0], point.Value)))
             {
                 range = selection[0].Clone();
                 if (!TrimRange(range, selected, out selected)) return false;
@@ -115,10 +116,10 @@ public sealed partial class ManualCorrectionService
                 if (!match.Success || !TrimRange(range, expanded, out selected, match.Index, match.Length)) return false;
             }
             if (selected.Length is < 2 or > 300 || selected.Any(char.IsControl)) return false;
-            target = new(element, range, selected, window, string.Join('.', element.GetRuntimeId()));
+            target = new(element, range, selected, window, string.Join('.', element.GetRuntimeId()), point);
             return true;
         }
-        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
         {
             return false;
         }
@@ -211,9 +212,19 @@ public sealed partial class ManualCorrectionService
                 return;
             }
             var replacement = result.Replacement.Trim();
-            if (!_input.ReplaceTextRange(target.Element, target.Range, target.OriginalText, replacement))
+            var applyTarget = RefreshTarget(target);
+            var replacementResult = _input.ReplaceTextRangeDetailed(applyTarget.Element, applyTarget.Range,
+                applyTarget.OriginalText, replacement, out var replacementDiagnostic);
+            if (replacementResult != TextReplacementResult.Applied)
             {
-                ShowStatus(target, "The selected text changed before it could be corrected.");
+                await _logger.WriteAsync("ManualCorrectionApplyFailed", new Dictionary<string, object?>
+                {
+                    ["Process"] = target.Window.ProcessName,
+                    ["Result"] = replacementResult.ToString(),
+                    ["TargetLength"] = target.OriginalText.Length,
+                    ["Diagnostic"] = replacementDiagnostic
+                });
+                ShowStatus(target, ReplacementFailureMessage(replacementResult, replacementDiagnostic));
                 return;
             }
             await _memory.RecordCorrectionAsync(target.OriginalText, replacement, protectedTokens);
@@ -232,6 +243,30 @@ public sealed partial class ManualCorrectionService
         var point = new CaretPositionService().GetCaretScreenPosition(target.Window.WindowHandle);
         _status.ShowMessage(message, point);
     }
+
+    private static ManualCorrectionTarget RefreshTarget(ManualCorrectionTarget target)
+    {
+        if (target.CapturePoint is not { } point) return target;
+        return TryCaptureFromElement(target.Element, target.Window, point, out var refreshed) &&
+               string.Equals(refreshed.OriginalText, target.OriginalText, StringComparison.Ordinal)
+            ? refreshed
+            : target;
+    }
+
+    internal static string ReplacementFailureMessage(TextReplacementResult result, string? diagnostic = null) => result switch
+    {
+        TextReplacementResult.TextChanged =>
+            "The word is no longer at its original location, so no text was changed.",
+        TextReplacementResult.ClipboardUnavailable =>
+            "Correction could not access the clipboard. Your text and cursor were restored.",
+        TextReplacementResult.SelectionUnavailable =>
+            diagnostic?.Contains("focusMatch=False", StringComparison.OrdinalIgnoreCase) == true
+                ? "The editor did not regain focus in time. Nothing was changed; please try again."
+                : "The editor did not confirm the text selection after three attempts. Nothing was changed; please try again.",
+        TextReplacementResult.PasteFailed =>
+            "The correction could not be inserted. Your text and cursor were restored.",
+        _ => "The editor became unavailable. No correction was applied."
+    };
 
     private static string CleanReason(string reason) => string.IsNullOrWhiteSpace(reason)
         ? "the intended spelling was unclear."
@@ -257,5 +292,5 @@ public sealed partial class ManualCorrectionService
     private static partial Regex Word();
 
     internal sealed record ManualCorrectionTarget(AutomationElement Element, TextPatternRange Range, string OriginalText,
-        WindowIdentity Window, string FocusedElementId);
+        WindowIdentity Window, string FocusedElementId, System.Windows.Point? CapturePoint);
 }
