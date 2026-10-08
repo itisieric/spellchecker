@@ -4,12 +4,16 @@ using LLMAutocorrect.Correction;
 using LLMAutocorrect.Input;
 using LLMAutocorrect.Models;
 using LLMAutocorrect.Memory;
+using LLMAutocorrect.Providers;
 using LLMAutocorrect.Security;
 using LLMAutocorrect.UI;
 using LLMAutocorrect.Windows;
 using Forms = System.Windows.Forms;
 using System.Runtime.InteropServices;
 using System.IO.Compression;
+using System.Net;
+using System.Text;
+using System.Text.Json;
 
 if (args.Contains("--sendinput-smoke", StringComparer.Ordinal))
     return RunSendInputSmoke();
@@ -48,7 +52,15 @@ var tests = new (string Name, Action Run)[]
     ("terminal processes never receive prose autocorrect", TerminalProcessesNeverReceiveAutocorrect),
     ("terminal defaults provide ten suggestions", TerminalDefaultsProvideTenSuggestions),
     ("terminal completion is independent from regular autocorrect", TerminalCompletionIsIndependent),
-    ("Flash-Lite is the default model", FlashLiteIsDefaultModel),
+    ("Ollama Qwen is the default provider", OllamaQwenIsDefaultProvider),
+    ("provider endpoint privacy distinguishes PC LAN and cloud", ProviderEndpointPrivacy),
+    ("provider client enforces private mode before network access", ProviderClientEnforcesPrivateMode),
+    ("provider schema is normalized for local engines", ProviderSchemaIsNormalized),
+    ("Ollama correction uses structured local request", OllamaCorrectionUsesStructuredRequest),
+    ("OpenAI-compatible provider sends protected bearer token", OpenAiProviderUsesBearerToken),
+    ("provider settings migration retains Gemini and selects Ollama", ProviderSettingsMigration),
+    ("provider credentials are not serialized with settings", ProviderCredentialsAreNotSerialized),
+    ("Gemini billing errors are actionable and not retried", GeminiBillingErrorsAreActionable),
     ("autocomplete dictionary terms require context", DictionaryTermsRequireContext),
     ("personal memory learns without storing prefixes", PersonalMemoryLearnsSafely),
     ("spelling history ranks words and keeps variants", SpellingHistoryRanksVariants),
@@ -63,6 +75,16 @@ var tests = new (string Name, Action Run)[]
     ,("typing after backspace remains correctable", TypingAfterBackspaceRemainsCorrectable)
     ,("modified backspace invalidates suffix", ModifiedBackspaceInvalidatesSuffix)
     ,("enter then backspace cancels stale line correction", EnterThenBackspaceCancelsLineCorrection)
+    ,("safe insertion retry succeeds after transient failures", SafeInsertionRetrySucceeds)
+    ,("safe insertion retry stops after typing Enter Backspace or cursor movement", SafeInsertionRetryStopsAfterInput)
+    ,("safe insertion retry distinguishes ambiguous and exhausted failures", SafeInsertionRetryDistinguishesFailures)
+    ,("mutation currentness is rechecked after waiting for key release", MutationCurrentnessIsRecheckedAfterKeyWait)
+    ,("unanchored autocomplete retries only before mutation", UnanchoredInsertionRetryPolicy)
+    ,("insertion retry defaults are bounded", InsertionRetryDefaultsAreBounded)
+    ,("text mismatch diagnostics do not log sentence content", TextMismatchDiagnosticsAreMetadataOnly)
+    ,("leading case-only editor normalization is safe", LeadingCaseOnlyEditorNormalization)
+    ,("correction response retry is bounded", CorrectionResponseRetryIsBounded)
+    ,("stale physical key state is reconciled", StalePhysicalKeyStateIsReconciled)
     ,("simulated replacement is exact", SimulatedReplacementIsExact)
     ,("1000 mixed Enter and Backspace sequences stay stale-safe", MixedEnterBackspaceStress)
 };
@@ -288,7 +310,169 @@ static void TerminalCompletionIsIndependent()
     Assert(!AutocompleteCoordinator.FeatureEnabled(settings, true));
 }
 
-static void FlashLiteIsDefaultModel() => Equal("gemini-3.5-flash-lite", new AppSettings().GeminiModel);
+static void OllamaQwenIsDefaultProvider()
+{
+    var settings = new AppSettings();
+    Equal(AiProviderKind.Ollama, settings.Provider);
+    Equal("qwen3.5:4b", settings.OllamaProvider.Model);
+    Equal("http://127.0.0.1:11434", settings.OllamaProvider.Endpoint);
+    Equal("gemini-3.5-flash-lite", settings.GeminiProvider.Model);
+}
+
+static void ProviderEndpointPrivacy()
+{
+    Assert(ProviderEndpointPolicy.TryValidate("http://127.0.0.1:11434", out var loopback, out _));
+    Assert(ProviderEndpointPolicy.IsSameComputer(loopback));
+    Assert(ProviderEndpointPolicy.TryValidate("http://192.168.1.50:11434", out var lan, out _));
+    Assert(!ProviderEndpointPolicy.IsSameComputer(lan));
+    Assert(ProviderEndpointPolicy.IsPrivateNetwork(lan));
+    Assert(ProviderEndpointPolicy.SecurityWarning(lan, ProviderAuthentication.BearerToken) is not null);
+    Assert(ProviderEndpointPolicy.TryValidate("https://api.example.com/v1", out var cloud, out _));
+    Assert(!ProviderEndpointPolicy.IsPrivateNetwork(cloud));
+    Assert(!ProviderEndpointPolicy.TryValidate("http://user:secret@127.0.0.1:11434", out _, out _));
+
+    var settings = new AppSettings { PrivateMode = true };
+    Assert(ProviderEndpointPolicy.IsAllowedByPrivateMode(settings));
+    settings.OllamaProvider.Endpoint = "http://192.168.1.50:11434";
+    Assert(!ProviderEndpointPolicy.IsAllowedByPrivateMode(settings));
+}
+
+static void ProviderSchemaIsNormalized()
+{
+    var normalized = ProviderClient.NormalizeSchema(new
+    {
+        type = "OBJECT",
+        properties = new { suggestions = new { type = "ARRAY", items = new { type = "STRING" } } }
+    });
+    Equal("object", normalized.GetProperty("type").GetString());
+    Equal("array", normalized.GetProperty("properties").GetProperty("suggestions").GetProperty("type").GetString());
+    Equal("string", normalized.GetProperty("properties").GetProperty("suggestions").GetProperty("items").GetProperty("type").GetString());
+}
+
+static void ProviderClientEnforcesPrivateMode()
+{
+    var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+    using var http = new HttpClient(handler);
+    var settings = new SettingsManager();
+    settings.Current.Provider = AiProviderKind.Ollama;
+    settings.Current.PrivateMode = true;
+    settings.Current.OllamaProvider.Endpoint = "http://192.168.1.50:11434";
+    using var client = new ProviderClient(settings, new MemorySecretStore(), http);
+    try
+    {
+        client.GenerateJsonAsync("test", new { value = "private" }, new { type = "OBJECT" },
+            CancellationToken.None).GetAwaiter().GetResult();
+        throw new InvalidOperationException("Private Mode should have blocked the LAN provider.");
+    }
+    catch (ProviderUnavailableException ex)
+    {
+        Assert(!ex.IsRetryable);
+        Assert(ex.UserMessage.Contains("Private Mode", StringComparison.Ordinal));
+    }
+    Equal(0, handler.CallCount);
+}
+
+static void OllamaCorrectionUsesStructuredRequest()
+{
+    var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("{\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"should_replace\\\":true,\\\"replacement\\\":\\\"I have not typed.\\\",\\\"change_type\\\":\\\"spelling_grammar\\\",\\\"uncertain\\\":false,\\\"reason\\\":\\\"\\\"}\"}}", Encoding.UTF8, "application/json")
+    });
+    using var http = new HttpClient(handler);
+    var settings = new SettingsManager();
+    settings.Current.Provider = AiProviderKind.Ollama;
+    settings.Current.OllamaProvider = AiProviderDefaults.Create(AiProviderKind.Ollama);
+    using var client = new ProviderClient(settings, new MemorySecretStore(), http);
+    var provider = new AiCorrectionProvider(client, settings);
+    var result = provider.CorrectAsync(new CorrectionRequest("", "i havent typped", [], [],
+        CorrectionMode.Conservative), CancellationToken.None).GetAwaiter().GetResult();
+    Assert(result.ShouldReplace);
+    Equal("I have not typed.", result.Replacement);
+    Equal("http://127.0.0.1:11434/api/chat", handler.RequestUri?.AbsoluteUri);
+    Assert(handler.RequestBody?.Contains("\"model\":\"qwen3.5:4b\"", StringComparison.Ordinal) == true);
+    Assert(handler.RequestBody?.Contains("\"think\":false", StringComparison.Ordinal) == true);
+    Assert(handler.RequestBody?.Contains("\"keep_alive\":-1", StringComparison.Ordinal) == true);
+    Assert(handler.RequestBody?.Contains("\"format\":{\"type\":\"object\"", StringComparison.Ordinal) == true);
+    Assert(handler.Authorization is null);
+}
+
+static void OpenAiProviderUsesBearerToken()
+{
+    var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("{\"choices\":[{\"message\":{\"content\":\"{\\\"suggestions\\\":[\\\" this works\\\"]}\"}}]}", Encoding.UTF8, "application/json")
+    });
+    using var http = new HttpClient(handler);
+    var settings = new SettingsManager();
+    settings.Current.Provider = AiProviderKind.OpenAICompatible;
+    settings.Current.OpenAICompatibleProvider = new AiProviderSettings
+    {
+        Endpoint = "https://provider.example/v1",
+        Model = "small-model",
+        Authentication = ProviderAuthentication.BearerToken,
+        AuthenticationHeader = "Authorization",
+        AuthenticationPrefix = "Bearer"
+    };
+    var secrets = new MemorySecretStore();
+    secrets.Write(AiProviderKind.OpenAICompatible, "test-token-value");
+    using var client = new ProviderClient(settings, secrets, http);
+    var provider = new AiAutocompleteProvider(client, settings);
+    var result = provider.PredictAsync(new AutocompleteRequest("finish", [], 3, 8,
+        AutocompleteMode.Normal), CancellationToken.None).GetAwaiter().GetResult();
+    Equal(1, result.Candidates.Count);
+    Equal("https://provider.example/v1/chat/completions", handler.RequestUri?.AbsoluteUri);
+    Equal("Bearer test-token-value", handler.Authorization);
+    Assert(handler.RequestBody?.Contains("\"response_format\":{\"type\":\"json_schema\"", StringComparison.Ordinal) == true);
+}
+
+static void ProviderSettingsMigration()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-settings-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        File.WriteAllText(Path.Combine(directory, "settings.json"),
+            "{\"settingsVersion\":5,\"provider\":\"Gemini\",\"geminiModel\":\"gemini-legacy-test\"}");
+        var manager = new SettingsManager(directory);
+        manager.LoadAsync().GetAwaiter().GetResult();
+        Equal(AiProviderKind.Ollama, manager.Current.Provider);
+        Equal("qwen3.5:4b", manager.Current.OllamaProvider.Model);
+        Equal("gemini-legacy-test", manager.Current.GeminiProvider.Model);
+        Equal(SettingsManager.CurrentSettingsVersion, manager.Current.SettingsVersion);
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void ProviderCredentialsAreNotSerialized()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-settings-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var manager = new SettingsManager(directory);
+        var secrets = new MemorySecretStore();
+        secrets.Write(AiProviderKind.Gemini, "must-not-appear-in-settings");
+        manager.SaveAsync().GetAwaiter().GetResult();
+        var serialized = File.ReadAllText(manager.SettingsPath);
+        Assert(!serialized.Contains("must-not-appear-in-settings", StringComparison.Ordinal));
+        Equal("must-not-appear-in-settings", secrets.Read(AiProviderKind.Gemini));
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void GeminiBillingErrorsAreActionable()
+{
+    var depleted = GeminiClient.CreateHttpFailure(System.Net.HttpStatusCode.PaymentRequired,
+        "RESOURCE_EXHAUSTED", "Your prepayment credits are depleted.");
+    Equal(402, depleted.StatusCode);
+    Assert(!depleted.IsRetryable);
+    Assert(depleted.UserMessage.Contains("credits", StringComparison.OrdinalIgnoreCase));
+
+    var unavailable = GeminiClient.CreateHttpFailure(System.Net.HttpStatusCode.ServiceUnavailable,
+        "UNAVAILABLE", "Service unavailable.");
+    Assert(unavailable.IsRetryable);
+    Assert(unavailable.UserMessage.Contains("temporarily", StringComparison.OrdinalIgnoreCase));
+}
 
 static void DictionaryTermsRequireContext()
 {
@@ -505,6 +689,190 @@ static void EnterThenBackspaceCancelsLineCorrection()
     Assert(erased.Snapshot.IsSynchronized);
     Equal("i just hit enter", erased.Snapshot.BufferText);
     Assert(!buffer.TryReplaceSuffix(version - 1, "i just hit enter\n", "I just hit Enter.\n", version + 1));
+}
+
+static void SafeInsertionRetrySucceeds()
+{
+    var attempts = 0;
+    var outcome = SafeMutationRetry.RunAsync(
+            2, 100,
+            () => true,
+            () =>
+            {
+                attempts++;
+                return new MutationAttempt<bool>(attempts == 3, $"stage=simulated-{attempts}");
+            },
+            applied => applied,
+            (_, _) => true,
+            CancellationToken.None)
+        .GetAwaiter().GetResult();
+    Assert(outcome.Succeeded);
+    Equal(MutationStopReason.None, outcome.StopReason);
+    Assert(!outcome.ShouldInvalidateTrackedText);
+    Equal(3, outcome.Attempts);
+    Equal(3, attempts);
+    Equal(3, outcome.Diagnostics.Count);
+}
+
+static void SafeInsertionRetryStopsAfterInput()
+{
+    foreach (var input in new[] { "typing", "enter", "backspace", "cursor-movement" })
+    {
+        var clock = new InputVersionClock();
+        var expectedVersion = clock.Current;
+        var attempts = 0;
+        var outcome = SafeMutationRetry.RunAsync(
+                3, 100,
+                () => clock.Current == expectedVersion,
+                () =>
+                {
+                    attempts++;
+                    clock.Increment();
+                    return new MutationAttempt<bool>(false, $"stage={input}");
+                },
+                applied => applied,
+                (_, _) => true,
+                CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(!outcome.Succeeded);
+        Equal(MutationStopReason.CurrentnessLost, outcome.StopReason);
+        Assert(!outcome.ShouldInvalidateTrackedText);
+        Equal(1, outcome.Attempts);
+        Equal(1, attempts);
+    }
+}
+
+static void SafeInsertionRetryDistinguishesFailures()
+{
+    var ambiguous = SafeMutationRetry.RunAsync(
+            3, 100,
+            () => true,
+            () => new MutationAttempt<bool>(false, "stage=fallback-paste verification-failed"),
+            applied => applied,
+            (_, _) => false,
+            CancellationToken.None)
+        .GetAwaiter().GetResult();
+    Assert(!ambiguous.Succeeded);
+    Equal(MutationStopReason.AmbiguousMutation, ambiguous.StopReason);
+    Equal(1, ambiguous.Attempts);
+    Assert(ambiguous.ShouldInvalidateTrackedText);
+
+    var exhausted = SafeMutationRetry.RunAsync(
+            1, 100,
+            () => true,
+            () => new MutationAttempt<bool>(false, "stage=selection-timeout"),
+            applied => applied,
+            (_, _) => true,
+            CancellationToken.None)
+        .GetAwaiter().GetResult();
+    Assert(!exhausted.Succeeded);
+    Equal(MutationStopReason.AttemptsExhausted, exhausted.StopReason);
+    Equal(2, exhausted.Attempts);
+    Assert(!exhausted.ShouldInvalidateTrackedText);
+}
+
+static void MutationCurrentnessIsRecheckedAfterKeyWait()
+{
+    var current = true;
+    var waits = 0;
+    var attempts = 0;
+    var outcome = SafeMutationRetry.RunAsync(
+            0, 100,
+            () => SafeMutationRetry.CanAttempt(
+                () => current,
+                () =>
+                {
+                    waits++;
+                    current = false;
+                    return true;
+                }),
+            () =>
+            {
+                attempts++;
+                return new MutationAttempt<bool>(true, "stage=should-not-run");
+            },
+            applied => applied,
+            (_, _) => true,
+            CancellationToken.None)
+        .GetAwaiter().GetResult();
+
+    Assert(!outcome.Succeeded);
+    Equal(MutationStopReason.CurrentnessLost, outcome.StopReason);
+    Equal(1, waits);
+    Equal(0, attempts);
+    Equal(0, outcome.Attempts);
+    Assert(!outcome.ShouldInvalidateTrackedText);
+}
+
+static void UnanchoredInsertionRetryPolicy()
+{
+    Assert(SendInputService.CanSafelyRetry(string.Empty, "stage=selection timeout attempts=3"));
+    Assert(SendInputService.CanSafelyRetry(string.Empty, "stage=value-pattern unavailable-or-readonly"));
+    Assert(!SendInputService.CanSafelyRetry(string.Empty, "stage=fallback-paste verification-failed"));
+    Assert(!SendInputService.CanSafelyRetry(string.Empty, "stage=exception type=COMException"));
+    Assert(!SendInputService.CanSafelyRetry("original text", "stage=fallback-paste verification-failed"));
+    Assert(SendInputService.CanSafelyRetry("original text",
+        "stage=fallback-paste verification-failed original-selection-confirmed=True"));
+}
+
+static void InsertionRetryDefaultsAreBounded()
+{
+    var settings = new AppSettings();
+    Equal(350, settings.InsertionRetryDelayMs);
+    Equal(2, settings.InsertionRetryAttempts);
+    Assert(settings.InsertionRetryDelayMs is >= 100 and <= 3000);
+    Assert(settings.InsertionRetryAttempts is >= 0 and <= 3);
+}
+
+static void TextMismatchDiagnosticsAreMetadataOnly()
+{
+    var diagnostic = SendInputService.DescribeMismatch("alpha beta", "alpha\u00A0beta");
+    Assert(diagnostic.Contains("mismatchIndex=5", StringComparison.Ordinal));
+    Assert(diagnostic.Contains("expectedKind=space", StringComparison.Ordinal));
+    Assert(diagnostic.Contains("actualKind=nonbreaking-space", StringComparison.Ordinal));
+    Assert(!diagnostic.Contains("alpha", StringComparison.Ordinal));
+    Assert(!diagnostic.Contains("beta", StringComparison.Ordinal));
+}
+
+static void LeadingCaseOnlyEditorNormalization()
+{
+    Assert(SendInputService.IsLeadingCaseOnlyDifference("this is a test", "This is a test"));
+    Assert(SendInputService.IsLeadingCaseOnlyDifference("This is a test", "this is a test"));
+    Assert(!SendInputService.IsLeadingCaseOnlyDifference("this is a test", "Xhis is a test"));
+    Assert(!SendInputService.IsLeadingCaseOnlyDifference("this is a test", "This is a Test"));
+    Assert(!SendInputService.IsLeadingCaseOnlyDifference("1 test", "2 test"));
+}
+
+static void CorrectionResponseRetryIsBounded()
+{
+    var valid = new CorrectionValidation(true, .1, "valid");
+    var explanation = new CorrectionValidation(false, 1, "explanation-or-markdown");
+    Assert(CorrectionResponseRetry.ShouldRetry(explanation, false, true));
+    Assert(!CorrectionResponseRetry.ShouldRetry(explanation, true, true));
+    Assert(!CorrectionResponseRetry.ShouldRetry(explanation, false, false));
+    Assert(!CorrectionResponseRetry.ShouldRetry(valid, false, true));
+
+    var request = new CorrectionRequest("", "havent typped", [], [], CorrectionMode.Conservative);
+    Assert(!request.StrictReplacementOnly);
+    Assert(CorrectionResponseRetry.CreateStrictRequest(request).StrictReplacementOnly);
+}
+
+static void StalePhysicalKeyStateIsReconciled()
+{
+    var physicallyDown = new HashSet<int>();
+    var state = new PhysicalKeyState(physicallyDown.Contains, TimeSpan.Zero);
+    state.KeyDown(NativeMethods.VkShift);
+    Assert(state.AnyPressed);
+    Assert(state.WaitUntilReleased(TimeSpan.Zero));
+    Assert(!state.AnyPressed);
+    Equal("pressedKeyCount=0", state.LastWaitDiagnostic);
+
+    physicallyDown.Add(NativeMethods.VkControl);
+    state.KeyDown(NativeMethods.VkControl);
+    Assert(!state.WaitUntilReleased(TimeSpan.Zero));
+    Assert(state.LastWaitDiagnostic.Contains("pressedKeyCount=1", StringComparison.Ordinal));
+    physicallyDown.Clear();
+    Assert(state.WaitUntilReleased(TimeSpan.Zero));
 }
 
 static void SimulatedReplacementIsExact()
@@ -890,6 +1258,29 @@ static int RunUiaReplacementSmoke()
                     new System.Windows.Point(wordPoint.X, wordPoint.Y), out var manualTarget))
                 throw new InvalidOperationException("Right-click word targeting failed.");
             Equal("mistkae", manualTarget.OriginalText);
+            var allowManualCommit = true;
+            bool ManualCommitIsCurrent()
+            {
+                if (!allowManualCommit) return false;
+                var selection = valuePattern.GetSelection();
+                if (selection.Length == 1 && string.Equals(selection[0].GetText(-1), "mistkae",
+                        StringComparison.Ordinal))
+                {
+                    allowManualCommit = false;
+                    return false;
+                }
+                return true;
+            }
+            var staleManualResult = new SendInputService().ReplaceTextRangeDetailed(valueElement,
+                manualTarget.Range, manualTarget.OriginalText, "mistake", ManualCommitIsCurrent,
+                out var staleManualDiagnostic);
+            Equal(TextReplacementResult.Stale, staleManualResult);
+            Assert(staleManualDiagnostic.Contains("stale", StringComparison.Ordinal));
+            Equal("please fix mistkae now", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal("please fix mistkae now".Length,
+                (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+            Equal(0, (int)form.Invoke(new Func<int>(() => valueBox.SelectionLength)));
+
             var manualResult = new SendInputService().ReplaceTextRangeDetailed(valueElement, manualTarget.Range,
                 manualTarget.OriginalText, "mistake", out var manualDiagnostic);
             if (manualResult != TextReplacementResult.Applied)
@@ -908,10 +1299,47 @@ static int RunUiaReplacementSmoke()
                 valueBox.SelectionStart = 9;
                 valueBox.SelectionLength = 6;
             });
-            if (!ManualCorrectionService.TryCaptureFromElement(valueElement, testWindow, null, out var selectedTarget))
+            var selectedPoint = (System.Drawing.Point)form.Invoke(new Func<System.Drawing.Point>(() =>
+                valueBox.PointToScreen(valueBox.GetPositionFromCharIndex(11))));
+            if (!ManualCorrectionService.TryCaptureFromElement(valueElement, testWindow,
+                    new System.Windows.Point(selectedPoint.X, selectedPoint.Y), out var selectedTarget))
                 throw new InvalidOperationException("Highlighted-text targeting failed.");
             Equal("adress", selectedTarget.OriginalText);
-            if (!new SendInputService().ReplaceTextRange(valueElement, selectedTarget.Range, selectedTarget.OriginalText, "address"))
+
+            // A still-valid captured range must never be reused after focus moves to
+            // a different editor, even when that editor contains the same word.
+            form.Invoke(() =>
+            {
+                richBox.Text = "adress";
+                richBox.SelectionStart = richBox.TextLength;
+                form.ActiveControl = richBox;
+                richBox.Focus();
+            });
+            Thread.Sleep(50);
+            Assert(!ManualCorrectionService.TryRefreshTarget(selectedTarget, out _,
+                out var changedEditorDiagnostic));
+            Equal("stage=refresh-focused-editor-changed", changedEditorDiagnostic);
+            Equal("this has adress here", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal("adress", (string)form.Invoke(new Func<string>(() => richBox.Text)));
+
+            // Simulate the non-activating offer click collapsing the editor's
+            // visible selection while the captured range remains valid.
+            form.Invoke(() =>
+            {
+                richBox.Text = "i just hit enter" + Environment.NewLine;
+                richBox.SelectionStart = richBox.TextLength;
+                valueBox.SelectionStart = valueBox.TextLength;
+                valueBox.SelectionLength = 0;
+                form.ActiveControl = valueBox;
+                valueBox.Focus();
+            });
+            Thread.Sleep(50);
+            if (!ManualCorrectionService.TryRefreshTarget(selectedTarget, out var refreshedTarget,
+                    out var refreshDiagnostic))
+                throw new InvalidOperationException("Collapsed highlighted range could not be refreshed: " +
+                                                    refreshDiagnostic);
+            if (!new SendInputService().ReplaceTextRange(valueElement, refreshedTarget.Range,
+                    refreshedTarget.OriginalText, "address"))
                 throw new InvalidOperationException("Highlighted-text replacement failed.");
             Equal("this has address here", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
 
@@ -929,10 +1357,10 @@ static int RunUiaReplacementSmoke()
     });
     automationThread.SetApartmentState(ApartmentState.STA);
     automationThread.Start();
-    if (!automationThread.Join(TimeSpan.FromSeconds(20))) throw new TimeoutException("UI Automation replacement test timed out.");
+    if (!automationThread.Join(TimeSpan.FromSeconds(35))) throw new TimeoutException("UI Automation replacement test timed out.");
     uiThread.Join(TimeSpan.FromSeconds(10));
     if (failure is not null) throw failure;
-    Console.WriteLine("UIA_REPLACEMENT_PASS exact non-duplicating replacement, beging right-click correction, whole-comment fallback, failed-selection cleanup, caret preservation, Enter, and Backspace continuation");
+    Console.WriteLine("UIA_REPLACEMENT_PASS exact non-duplicating replacement, stale manual cancellation, focused-editor validation, collapsed-selection refresh, beging right-click correction, whole-comment fallback, failed-selection cleanup, caret preservation, Enter, and Backspace continuation");
     return 0;
 
     static string PatternNames(System.Windows.Automation.AutomationElement element) => string.Join(',',
@@ -951,6 +1379,33 @@ static int RunUiaReplacementSmoke()
         var moved = range.MoveEndpointByUnit(System.Windows.Automation.Text.TextPatternRangeEndpoint.Start,
             System.Windows.Automation.Text.TextUnit.Character, -count);
         return $"degenerate={isDegenerate};moved={moved};text={ToCodePoints(range.GetText(-1))}";
+    }
+}
+
+sealed class MemorySecretStore : IProviderSecretStore
+{
+    private readonly Dictionary<AiProviderKind, string> _values = new();
+    public string? Read(AiProviderKind provider) => _values.GetValueOrDefault(provider);
+    public void Write(AiProviderKind provider, string secret) => _values[provider] = secret;
+    public void Delete(AiProviderKind provider) => _values.Remove(provider);
+    public bool Contains(AiProviderKind provider) => _values.ContainsKey(provider);
+}
+
+sealed class RecordingHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> responseFactory) : HttpMessageHandler
+{
+    public Uri? RequestUri { get; private set; }
+    public string? RequestBody { get; private set; }
+    public string? Authorization { get; private set; }
+    public int CallCount { get; private set; }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        CallCount++;
+        RequestUri = request.RequestUri;
+        RequestBody = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+        Authorization = request.Headers.Authorization?.ToString();
+        return responseFactory(request);
     }
 }
 

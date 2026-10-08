@@ -4,9 +4,11 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
 using LLMAutocorrect.Configuration;
+using LLMAutocorrect.Input;
 using LLMAutocorrect.Logging;
 using LLMAutocorrect.Memory;
 using LLMAutocorrect.Models;
+using LLMAutocorrect.Providers;
 using LLMAutocorrect.Security;
 using LLMAutocorrect.UI;
 using LLMAutocorrect.Windows;
@@ -29,23 +31,26 @@ public sealed partial class ManualCorrectionService
     private readonly ManualCorrectionOverlay _offer;
     private readonly StatusOverlay _status;
     private readonly DiagnosticsLogger _logger;
+    private readonly InputVersionClock _clock;
     private readonly SemaphoreSlim _correctionGate = new(1, 1);
 
     public ManualCorrectionService(ICorrectionProvider provider, SettingsManager settings, TechnicalDictionary dictionary,
         ProtectedTokenDetector tokens, CorrectionValidator validator, ApplicationExclusionManager exclusions,
         ForegroundWindowService foreground, FocusedControlService focused, SendInputService input,
         WritingMemory memory, SpellingHistory spellingHistory,
-        ManualCorrectionOverlay offer, StatusOverlay status, DiagnosticsLogger logger)
+        ManualCorrectionOverlay offer, StatusOverlay status, DiagnosticsLogger logger, InputVersionClock clock)
     {
         _provider = provider; _settings = settings; _dictionary = dictionary; _tokens = tokens; _validator = validator;
         _exclusions = exclusions; _foreground = foreground; _focused = focused; _input = input; _memory = memory;
         _spellingHistory = spellingHistory; _offer = offer; _status = status; _logger = logger;
+        _clock = clock;
     }
 
     public void OfferAt(System.Windows.Point point)
     {
         var settings = _settings.Current;
-        if (!settings.Enabled || settings.PrivateMode || !settings.ManualRightClickCorrectionEnabled) return;
+        if (!settings.Enabled || !ProviderEndpointPolicy.IsAllowedByPrivateMode(settings) ||
+            !settings.ManualRightClickCorrectionEnabled) return;
         var window = _foreground.GetCurrent();
         if (!_exclusions.IsAutocorrectAllowed(window.ProcessName)) return;
         if (!TryCapture(window, point, out var target)) return;
@@ -55,7 +60,7 @@ public sealed partial class ManualCorrectionService
     public void OfferCurrent()
     {
         var settings = _settings.Current;
-        if (!settings.Enabled || settings.PrivateMode) return;
+        if (!settings.Enabled || !ProviderEndpointPolicy.IsAllowedByPrivateMode(settings)) return;
         var window = _foreground.GetCurrent();
         if (!_exclusions.IsAutocorrectAllowed(window.ProcessName)) return;
         var point = new CaretPositionService().GetCaretScreenPosition(window.WindowHandle);
@@ -176,6 +181,7 @@ public sealed partial class ManualCorrectionService
         try
         {
             if (!_foreground.Matches(target.Window.WindowHandle, target.Window.ProcessId)) return;
+            var operationVersion = _clock.Current;
             var settings = _settings.Current;
             var preserveAddressBarStyle = ShouldPreserveAddressBarStyle(settings, _focused.GetCurrent(), target.Window.ProcessName);
             var protectedTokens = _tokens.Detect(target.OriginalText, _dictionary.Terms);
@@ -183,11 +189,52 @@ public sealed partial class ManualCorrectionService
                 CorrectionMode.Conservative, settings.CustomCorrectionInstructions, preserveAddressBarStyle,
                 _memory.GetSpellingHints(target.OriginalText));
             CorrectionResult result;
-            try { result = await _provider.CorrectAsync(request, CancellationToken.None); }
+            CorrectionValidation validation;
+            var responseRetryAttempted = false;
+            string? initialValidation = null;
+            var maximumEditRatio = Math.Max(.60, settings.MaximumEditRatio);
+            try
+            {
+                try { result = await _provider.CorrectAsync(request, CancellationToken.None); }
+                catch (ProviderUnavailableException ex) when (ex.IsRetryable &&
+                                                               ManualOperationIsCurrent(target, operationVersion))
+                {
+                    await Task.Delay(settings.CorrectionRetryDelayMs);
+                    if (!ManualOperationIsCurrent(target, operationVersion))
+                    {
+                        ShowStatus(target, "Correction cancelled because the text or cursor changed.");
+                        return;
+                    }
+                    result = await _provider.CorrectAsync(request, CancellationToken.None);
+                    await _logger.WriteAsync("ManualCorrectionProviderRetrySucceeded",
+                        new Dictionary<string, object?> { ["Process"] = target.Window.ProcessName });
+                }
+
+                validation = _validator.Validate(request, result, maximumEditRatio);
+                if (CorrectionResponseRetry.ShouldRetry(validation, responseRetryAttempted,
+                        ManualOperationIsCurrent(target, operationVersion)))
+                {
+                    initialValidation = validation.Reason;
+                    responseRetryAttempted = true;
+                    request = CorrectionResponseRetry.CreateStrictRequest(request);
+                    result = await _provider.CorrectAsync(request, CancellationToken.None);
+                    validation = _validator.Validate(request, result, maximumEditRatio);
+                }
+            }
             catch (Exception ex)
             {
-                await _logger.WriteAsync("ManualCorrectionFailed", new Dictionary<string, object?> { ["Type"] = ex.GetType().Name });
-                ShowStatus(target, "Spelling correction is temporarily unavailable.");
+                var metadata = new Dictionary<string, object?> { ["Type"] = ex.GetType().Name };
+                if (ex is ProviderUnavailableException provider)
+                {
+                    metadata["HttpStatus"] = provider.StatusCode;
+                    metadata["ProviderStatus"] = provider.ProviderStatus;
+                    metadata["Retryable"] = provider.IsRetryable;
+                    metadata["Reason"] = provider.Message;
+                }
+                await _logger.WriteAsync("ManualCorrectionFailed", metadata);
+                ShowStatus(target, ex is ProviderUnavailableException unavailable
+                    ? unavailable.UserMessage
+                    : "Spelling correction is temporarily unavailable.");
                 return;
             }
             if (!result.ShouldReplace)
@@ -197,7 +244,6 @@ public sealed partial class ManualCorrectionService
                     : "No spelling correction was needed.");
                 return;
             }
-            var validation = _validator.Validate(request, result, Math.Max(.60, settings.MaximumEditRatio));
             if (!validation.IsValid)
             {
                 await _logger.WriteAsync("ManualCorrectionRejected", new Dictionary<string, object?>
@@ -206,25 +252,62 @@ public sealed partial class ManualCorrectionService
                     ["TargetLength"] = target.OriginalText.Length,
                     ["EditRatio"] = validation.EditRatio.ToString("F3"),
                     ["Validation"] = validation.Reason,
-                    ["Style"] = preserveAddressBarStyle ? "address-bar-spelling" : "standard"
+                    ["Style"] = preserveAddressBarStyle ? "address-bar-spelling" : "standard",
+                    ["ResponseRetryAttempted"] = responseRetryAttempted,
+                    ["InitialValidation"] = initialValidation
                 });
                 ShowStatus(target, ValidationMessage(validation.Reason));
                 return;
             }
             var replacement = result.Replacement.Trim();
-            var applyTarget = RefreshTarget(target);
-            var replacementResult = _input.ReplaceTextRangeDetailed(applyTarget.Element, applyTarget.Range,
-                applyTarget.OriginalText, replacement, out var replacementDiagnostic);
-            if (replacementResult != TextReplacementResult.Applied)
+            var mutation = await SafeMutationRetry.RunAsync(
+                settings.InsertionRetryAttempts,
+                settings.InsertionRetryDelayMs,
+                () => SafeMutationRetry.CanAttempt(
+                    () => ManualOperationIsCurrent(target, operationVersion), _input.WaitForPhysicalKeysReleased),
+                () =>
+                {
+                    if (!TryRefreshTarget(target, out var applyTarget, out var refreshDiagnostic))
+                        return new MutationAttempt<TextReplacementResult>(TextReplacementResult.EditorUnavailable,
+                            refreshDiagnostic);
+                    var applyResult = _input.ReplaceTextRangeDetailed(applyTarget.Element, applyTarget.Range,
+                        applyTarget.OriginalText, replacement,
+                        () => ManualOperationIsCurrent(target, operationVersion), out var applyDiagnostic);
+                    return new MutationAttempt<TextReplacementResult>(applyResult, applyDiagnostic);
+                },
+                applyResult => applyResult == TextReplacementResult.Applied,
+                (applyResult, diagnostic) => applyResult == TextReplacementResult.Stale ||
+                                             SendInputService.CanSafelyRetry(target.OriginalText, diagnostic),
+                CancellationToken.None);
+            if (!mutation.Succeeded)
             {
+                var replacementResult = mutation.LastResult ?? TextReplacementResult.EditorUnavailable;
+                var effectiveStopReason = replacementResult == TextReplacementResult.Stale
+                    ? MutationStopReason.CurrentnessLost
+                    : mutation.StopReason;
+                var replacementDiagnostic = mutation.Diagnostics.Count == 0
+                    ? "stage=safety-check-changed"
+                    : string.Join(" || ", mutation.Diagnostics);
                 await _logger.WriteAsync("ManualCorrectionApplyFailed", new Dictionary<string, object?>
                 {
                     ["Process"] = target.Window.ProcessName,
                     ["Result"] = replacementResult.ToString(),
                     ["TargetLength"] = target.OriginalText.Length,
-                    ["Diagnostic"] = replacementDiagnostic
+                    ["Attempts"] = mutation.Attempts,
+                    ["MutationStopReason"] = effectiveStopReason.ToString(),
+                    ["MutationMayHaveOccurred"] = mutation.ShouldInvalidateTrackedText,
+                    ["Diagnostic"] = replacementDiagnostic,
+                    ["ResponseRetryAttempted"] = responseRetryAttempted,
+                    ["InitialValidation"] = initialValidation
                 });
-                ShowStatus(target, ReplacementFailureMessage(replacementResult, replacementDiagnostic));
+                ShowStatus(target, effectiveStopReason switch
+                {
+                    MutationStopReason.CurrentnessLost =>
+                        "Correction cancelled because new input, focus, or editor state changed.",
+                    MutationStopReason.AmbiguousMutation =>
+                        "The editor could not confirm whether the correction was inserted. Spellchecker stopped to avoid duplicating text.",
+                    _ => ReplacementFailureMessage(replacementResult, replacementDiagnostic)
+                });
                 return;
             }
             await _memory.RecordCorrectionAsync(target.OriginalText, replacement, protectedTokens);
@@ -232,7 +315,10 @@ public sealed partial class ManualCorrectionService
             ShowStatus(target, $"{target.OriginalText} → {replacement}");
             await _logger.WriteAsync("ManualCorrectionCompleted", new Dictionary<string, object?>
             {
-                ["Characters"] = target.OriginalText.Length, ["EditRatio"] = validation.EditRatio.ToString("F3")
+                ["Characters"] = target.OriginalText.Length,
+                ["EditRatio"] = validation.EditRatio.ToString("F3"),
+                ["ResponseRetryAttempted"] = responseRetryAttempted,
+                ["InitialValidation"] = initialValidation
             });
         }
         finally { _correctionGate.Release(); }
@@ -244,17 +330,97 @@ public sealed partial class ManualCorrectionService
         _status.ShowMessage(message, point);
     }
 
-    private static ManualCorrectionTarget RefreshTarget(ManualCorrectionTarget target)
+    private bool ManualOperationIsCurrent(ManualCorrectionTarget target, long operationVersion) =>
+        _clock.Current == operationVersion &&
+        _foreground.Matches(target.Window.WindowHandle, target.Window.ProcessId);
+
+    internal static bool TryRefreshTarget(ManualCorrectionTarget target, out ManualCorrectionTarget refreshed,
+        out string diagnostic)
     {
-        if (target.CapturePoint is not { } point) return target;
-        return TryCaptureFromElement(target.Element, target.Window, point, out var refreshed) &&
-               string.Equals(refreshed.OriginalText, target.OriginalText, StringComparison.Ordinal)
-            ? refreshed
-            : target;
+        refreshed = null!;
+        diagnostic = "stage=refresh-focused-element-unavailable";
+        try
+        {
+            var focused = AutomationElement.FocusedElement;
+            if (focused is null) return false;
+            var candidates = SendInputService.ReplacementCandidates(focused).ToArray();
+            if (!candidates.Any(candidate => string.Equals(SafeRuntimeId(candidate), target.FocusedElementId,
+                    StringComparison.Ordinal)))
+            {
+                diagnostic = "stage=refresh-focused-editor-changed";
+                return false;
+            }
+
+            // Clicking the non-activating correction offer can collapse the visible
+            // selection in a WebView editor. The captured TextPatternRange remains
+            // usable, so prefer it when the same editor is still focused and the
+            // exact original text is still present. This avoids incorrectly turning
+            // a selected sentence back into only the word under the click point.
+            if (TryValidateCapturedTarget(target, out refreshed))
+            {
+                diagnostic = "stage=refresh-original-range-confirmed";
+                return true;
+            }
+
+            foreach (var candidate in candidates)
+            {
+                var runtimeId = SafeRuntimeId(candidate);
+                if (target.CapturePoint is null && target.FocusedElementId != runtimeId) continue;
+                if (!TryCaptureFromElement(candidate, target.Window, target.CapturePoint, out var captured)) continue;
+                if (!string.Equals(captured.OriginalText, target.OriginalText, StringComparison.Ordinal))
+                {
+                    diagnostic = "stage=refresh-text-changed";
+                    continue;
+                }
+                refreshed = captured;
+                diagnostic = "stage=refresh-confirmed";
+                return true;
+            }
+            diagnostic = "stage=refresh-target-not-found";
+            return false;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
+        {
+            diagnostic = $"stage=refresh-exception type={ex.GetType().Name} hresult={ex.HResult}";
+            return false;
+        }
     }
+
+    private static bool TryValidateCapturedTarget(ManualCorrectionTarget target,
+        out ManualCorrectionTarget refreshed)
+    {
+        refreshed = null!;
+        try
+        {
+            if (target.Element.Current.IsPassword) return false;
+            var range = target.Range.Clone();
+            if (!string.Equals(NormalizeNewlines(range.GetText(-1)), NormalizeNewlines(target.OriginalText),
+                    StringComparison.Ordinal)) return false;
+            refreshed = target with { Range = range };
+            return true;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static string? SafeRuntimeId(AutomationElement element)
+    {
+        try { return string.Join('.', element.GetRuntimeId()); }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static string NormalizeNewlines(string value) =>
+        value.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
 
     internal static string ReplacementFailureMessage(TextReplacementResult result, string? diagnostic = null) => result switch
     {
+        TextReplacementResult.Stale =>
+            "Correction cancelled because new input, focus, or editor state changed.",
         TextReplacementResult.TextChanged =>
             "The word is no longer at its original location, so no text was changed.",
         TextReplacementResult.ClipboardUnavailable =>

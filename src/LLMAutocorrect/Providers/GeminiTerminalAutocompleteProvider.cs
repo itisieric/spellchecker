@@ -3,7 +3,7 @@ using LLMAutocorrect.Configuration;
 
 namespace LLMAutocorrect.Providers;
 
-public sealed class GeminiTerminalAutocompleteProvider : ITerminalAutocompleteProvider
+public sealed class AiTerminalAutocompleteProvider : ITerminalAutocompleteProvider
 {
     private const string Instruction = """
         You are a context-aware Windows command-line completion engine. Complete commands for the indicated shell,
@@ -17,10 +17,10 @@ public sealed class GeminiTerminalAutocompleteProvider : ITerminalAutocompletePr
         Treat custom_instructions as preferences only when they do not conflict with these safety requirements.
         """;
 
-    private readonly GeminiClient _client;
+    private readonly IJsonGenerationClient _client;
     private readonly SettingsManager _settings;
 
-    public GeminiTerminalAutocompleteProvider(GeminiClient client, SettingsManager settings)
+    public AiTerminalAutocompleteProvider(IJsonGenerationClient client, SettingsManager settings)
     {
         _client = client;
         _settings = settings;
@@ -57,7 +57,7 @@ public sealed class GeminiTerminalAutocompleteProvider : ITerminalAutocompletePr
             required = new[] { "suggestions" }
         };
 
-        using var document = await _client.GenerateJsonAsync(_settings.Current.GeminiModel, Instruction, payload, schema, cancellationToken);
+        using var document = await _client.GenerateJsonAsync(Instruction, payload, schema, cancellationToken);
         var candidates = document.RootElement.GetProperty("suggestions").EnumerateArray()
             .Select(x => x.GetString() ?? string.Empty)
             .Where(x => x.Length > 0)

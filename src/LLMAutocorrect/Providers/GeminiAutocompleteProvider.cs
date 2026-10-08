@@ -3,7 +3,7 @@ using LLMAutocorrect.Configuration;
 
 namespace LLMAutocorrect.Providers;
 
-public sealed class GeminiAutocompleteProvider : IAutocompleteProvider
+public sealed class AiAutocompleteProvider : IAutocompleteProvider
 {
     private const string Instruction = """
         Continue text the user is currently writing. Return short, plausible continuations in the user's voice.
@@ -14,10 +14,10 @@ public sealed class GeminiAutocompleteProvider : IAutocompleteProvider
         Suggestions must be optional continuations only, with no explanations or markdown.
         """;
 
-    private readonly GeminiClient _client;
+    private readonly IJsonGenerationClient _client;
     private readonly SettingsManager _settings;
 
-    public GeminiAutocompleteProvider(GeminiClient client, SettingsManager settings)
+    public AiAutocompleteProvider(IJsonGenerationClient client, SettingsManager settings)
     {
         _client = client;
         _settings = settings;
@@ -52,7 +52,7 @@ public sealed class GeminiAutocompleteProvider : IAutocompleteProvider
             required = new[] { "suggestions" }
         };
 
-        using var document = await _client.GenerateJsonAsync(_settings.Current.GeminiModel, Instruction, payload, schema, cancellationToken);
+        using var document = await _client.GenerateJsonAsync(Instruction, payload, schema, cancellationToken);
         var candidates = document.RootElement.GetProperty("suggestions").EnumerateArray()
             .Select(x => x.GetString() ?? string.Empty)
             .Where(x => x.Length > 0)

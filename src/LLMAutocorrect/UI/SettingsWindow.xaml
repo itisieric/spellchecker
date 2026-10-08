@@ -22,18 +22,74 @@
         </StackPanel>
       </TabItem>
       <TabItem Header="AI Provider">
-        <StackPanel Margin="16">
-          <TextBlock Text="Provider" /><TextBox Text="Gemini" IsReadOnly="True" Width="260" HorizontalAlignment="Left" />
-          <TextBlock Text="Gemini model" Margin="0,12,0,4" />
-          <TextBox x:Name="ModelText" Width="300" HorizontalAlignment="Left" />
-          <TextBlock x:Name="ApiKeyStatus" Margin="0,14,0,0" TextWrapping="Wrap" />
-        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="16">
+            <TextBlock Text="Provider" />
+            <ComboBox x:Name="ProviderCombo" Width="260" HorizontalAlignment="Left"
+                      SelectionChanged="ProviderCombo_SelectionChanged" />
+            <TextBlock x:Name="ProviderDescription" Margin="0,8,0,0" Foreground="Gray" TextWrapping="Wrap" />
+
+            <TextBlock Text="Server or API base address" Margin="0,16,0,4" />
+            <TextBox x:Name="EndpointText" Width="500" HorizontalAlignment="Left"
+                     TextChanged="ProviderField_Changed" />
+            <TextBlock Margin="0,5,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="Examples: http://127.0.0.1:11434, http://192.168.1.50:11434, or https://api.example.com/v1" />
+
+            <TextBlock Text="Model" Margin="0,14,0,4" />
+            <TextBox x:Name="ProviderModelText" Width="360" HorizontalAlignment="Left" />
+
+            <TextBlock Text="Authentication" Margin="0,14,0,4" />
+            <ComboBox x:Name="ProviderAuthCombo" Width="220" HorizontalAlignment="Left"
+                      SelectionChanged="ProviderField_Changed" />
+            <WrapPanel Margin="0,10,0,0">
+              <StackPanel Margin="0,0,18,0">
+                <TextBlock Text="Header name" />
+                <TextBox x:Name="AuthHeaderText" Width="220" />
+              </StackPanel>
+              <StackPanel>
+                <TextBlock Text="Prefix (optional)" />
+                <TextBox x:Name="AuthPrefixText" Width="150" />
+              </StackPanel>
+            </WrapPanel>
+
+            <TextBlock Text="API key or token" Margin="0,14,0,4" />
+            <PasswordBox x:Name="CredentialPassword" Width="370" HorizontalAlignment="Left" />
+            <TextBlock x:Name="CredentialStatus" Margin="0,5,0,0" TextWrapping="Wrap" />
+            <TextBlock Margin="0,5,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="Leave this blank to keep the saved credential. New credentials are stored in Windows Credential Manager, never in settings.json or diagnostic logs." />
+
+            <WrapPanel Margin="0,14,0,0">
+              <StackPanel Margin="0,0,18,0">
+                <TextBlock Text="Context length" />
+                <TextBox x:Name="ContextLengthText" Width="120" />
+              </StackPanel>
+              <CheckBox x:Name="KeepModelLoadedCheck" VerticalAlignment="Bottom" Margin="0,0,0,4"
+                        Content="Keep a local model loaded for faster corrections" />
+            </WrapPanel>
+
+            <TextBlock x:Name="ProviderWarning" Margin="0,14,0,0" Foreground="DarkOrange" TextWrapping="Wrap" />
+            <WrapPanel Margin="0,14,0,0">
+              <Button x:Name="TestProviderButton" Content="Test provider" Width="120" Margin="0,0,8,0"
+                      Click="TestProvider_Click" />
+              <Button Content="Reset this preset" Width="140" Margin="0,0,8,0"
+                      Click="ResetProvider_Click" />
+              <Button Content="Clear saved credential" Width="170" Click="ClearCredential_Click" />
+            </WrapPanel>
+            <TextBlock x:Name="ProviderTestStatus" Margin="0,10,0,0" TextWrapping="Wrap" />
+          </StackPanel>
+        </ScrollViewer>
       </TabItem>
       <TabItem Header="Correction">
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="16">
             <TextBlock Text="Idle delay (ms)" /><TextBox x:Name="IdleDelayText" Width="120" HorizontalAlignment="Left" />
             <TextBlock Text="Maximum edit ratio (0–1)" Margin="0,12,0,0" /><TextBox x:Name="EditRatioText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Text="Safe insertion retry delay (ms)" Margin="0,12,0,0" />
+            <TextBox x:Name="InsertionRetryDelayText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Text="Insertion retry attempts (0-3)" Margin="0,12,0,0" />
+            <TextBox x:Name="InsertionRetryAttemptsText" Width="120" HorizontalAlignment="Left" />
+            <TextBlock Margin="0,6,0,0" Foreground="Gray" TextWrapping="Wrap"
+                       Text="A retry runs only if the same window, editor, cursor context, input version, and original text can be verified again. Set attempts to 0 to disable insertion retries." />
             <CheckBox x:Name="AddressBarSpellingOnlyCheck" Margin="0,18,0,0" Content="Browser address bars: spelling only (preserve capitalization and punctuation)" />
             <CheckBox x:Name="UncertainNotificationCheck" Margin="0,10,0,0" Content="Show a small message when a correction is uncertain or rejected for safety" />
             <CheckBox x:Name="SuccessNotificationCheck" Margin="0,10,0,0" Content="Show a small message after a successful correction" />
@@ -105,7 +161,7 @@
         </StackPanel>
       </TabItem>
       <TabItem Header="Privacy">
-        <StackPanel Margin="16"><CheckBox x:Name="PrivateModeCheck" Content="Private Mode (disable cloud correction and autocomplete)" /><TextBlock Margin="0,14,0,0" TextWrapping="Wrap" Text="Text is sent to Gemini only after password, application, sensitivity, and stale-context checks. Complete messages are never persisted; the Memory tab controls the small filtered entries used for personal learning." /></StackPanel>
+        <StackPanel Margin="16"><CheckBox x:Name="PrivateModeCheck" Content="Private Mode (allow AI only when it runs on this computer)" /><TextBlock Margin="0,14,0,0" TextWrapping="Wrap" Text="Private Mode permits a loopback provider such as Ollama at 127.0.0.1, but blocks cloud and LAN addresses. Outside Private Mode, text is sent only after password, application, sensitivity, and stale-context checks. Complete messages are never persisted." /></StackPanel>
       </TabItem>
       <TabItem Header="Diagnostics">
         <StackPanel Margin="16"><TextBlock x:Name="LogPath" TextWrapping="Wrap" /><TextBlock Text="Artificial latency (ms; developer testing)" Margin="0,14,0,0" /><TextBox x:Name="LatencyText" Width="120" HorizontalAlignment="Left" /></StackPanel>

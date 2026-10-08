@@ -4,6 +4,7 @@ using LLMAutocorrect.Input;
 using LLMAutocorrect.Logging;
 using LLMAutocorrect.Memory;
 using LLMAutocorrect.Models;
+using LLMAutocorrect.Providers;
 using LLMAutocorrect.Security;
 using LLMAutocorrect.UI;
 using LLMAutocorrect.Windows;
@@ -78,8 +79,12 @@ public sealed class CorrectionCoordinator : IDisposable
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            await _logger.WriteAsync("CorrectionFailed", new Dictionary<string, object?> { ["Type"] = ex.GetType().Name });
-            if (!cancellationToken.IsCancellationRequested)
+            await LogProviderFailureAsync("CorrectionFailed", ex);
+            if (ex is ProviderUnavailableException { IsRetryable: false } permanent)
+            {
+                ShowStatus(snapshot.Window.WindowHandle, permanent.UserMessage, true);
+            }
+            else if (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
@@ -90,8 +95,11 @@ public sealed class CorrectionCoordinator : IDisposable
                 catch (OperationCanceledException) { }
                 catch (Exception retryEx)
                 {
-                    await _logger.WriteAsync("CorrectionRetryFailed", new Dictionary<string, object?> { ["Type"] = retryEx.GetType().Name });
-                    ShowStatus(snapshot.Window.WindowHandle, "Spelling correction is temporarily unavailable.");
+                    await LogProviderFailureAsync("CorrectionRetryFailed", retryEx);
+                    ShowStatus(snapshot.Window.WindowHandle,
+                        retryEx is ProviderUnavailableException provider
+                            ? provider.UserMessage
+                            : "Spelling correction is temporarily unavailable.", true);
                 }
             }
         }
@@ -102,7 +110,11 @@ public sealed class CorrectionCoordinator : IDisposable
     {
         var settings = _settings.Current;
         if (!settings.Enabled) { await LogSkipAsync(snapshot, "disabled"); return; }
-        if (settings.PrivateMode) { await LogSkipAsync(snapshot, "private-mode"); return; }
+        if (!ProviderEndpointPolicy.IsAllowedByPrivateMode(settings))
+        {
+            await LogSkipAsync(snapshot, "private-mode-remote-provider");
+            return;
+        }
         if (!snapshot.IsSynchronized) { await LogSkipAsync(snapshot, "unsynchronized"); return; }
         if (!_exclusions.IsAutocorrectAllowed(snapshot.Window.ProcessName)) { await LogSkipAsync(snapshot, "excluded"); return; }
         var extracted = ExtractTarget(snapshot.BufferText, settings.MaximumTargetCharacters, settings.MaximumContextCharacters);
@@ -127,13 +139,31 @@ public sealed class CorrectionCoordinator : IDisposable
         Interlocked.Exchange(ref _busy, 1);
         var stopwatch = Stopwatch.StartNew();
         CorrectionResult result;
-        try { result = await _provider.CorrectAsync(request, cancellationToken); }
+        CorrectionValidation? validation = null;
+        var responseRetryAttempted = false;
+        string? initialValidation = null;
+        try
+        {
+            result = await _provider.CorrectAsync(request, cancellationToken);
+            if (result.ShouldReplace)
+            {
+                validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+                if (CorrectionResponseRetry.ShouldRetry(validation, isRetry, StillCurrent(requestSnapshot)))
+                {
+                    initialValidation = validation.Reason;
+                    responseRetryAttempted = true;
+                    request = CorrectionResponseRetry.CreateStrictRequest(request);
+                    result = await _provider.CorrectAsync(request, cancellationToken);
+                    validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+                }
+            }
+        }
         finally { Interlocked.Exchange(ref _busy, 0); }
         stopwatch.Stop();
 
         if (!result.ShouldReplace && result.Uncertain)
         {
-            if (!isRetry)
+            if (!isRetry && !responseRetryAttempted)
             {
                 await Task.Delay(settings.CorrectionRetryDelayMs, cancellationToken);
                 if (StillCurrent(requestSnapshot)) await ProcessAsync(snapshot, cancellationToken, true);
@@ -150,13 +180,15 @@ public sealed class CorrectionCoordinator : IDisposable
             return;
         }
 
-        var validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+        validation ??= _validator.Validate(request, result, settings.MaximumEditRatio);
         var metadata = new Dictionary<string, object?>
         {
             ["Process"] = snapshot.Window.ProcessName, ["TargetLength"] = extracted.Target.Length,
             ["LatencyMs"] = stopwatch.ElapsedMilliseconds, ["EditRatio"] = validation.EditRatio.ToString("F3"),
             ["Validation"] = validation.Reason,
-            ["Style"] = addressBarStyle ? "address-bar-spelling" : "standard"
+            ["Style"] = addressBarStyle ? "address-bar-spelling" : "standard",
+            ["ResponseRetryAttempted"] = responseRetryAttempted,
+            ["InitialValidation"] = initialValidation
         };
         if (!validation.IsValid)
         {
@@ -169,36 +201,70 @@ public sealed class CorrectionCoordinator : IDisposable
         // one final quiet window before touching the editor; any new key cancels this
         // scheduled correction and the newer snapshot gets its own request.
         await Task.Delay(settings.CorrectionCommitDelayMs, cancellationToken);
-        if (!StillCurrent(requestSnapshot)) { metadata["Result"] = "stale"; await _logger.WriteAsync("CorrectionDiscarded", metadata); return; }
-        if (!_input.WaitForPhysicalKeysReleased() || !StillCurrent(requestSnapshot))
+        if (!StillCurrent(requestSnapshot))
         {
-            metadata["Result"] = "physical-key-or-stale";
+            metadata["Result"] = "stale-before-key-wait";
+            await _logger.WriteAsync("CorrectionDiscarded", metadata);
+            return;
+        }
+        if (!_input.WaitForPhysicalKeysReleased())
+        {
+            metadata["Result"] = "physical-key-timeout";
+            metadata["PhysicalKeyDiagnostic"] = _input.PhysicalKeyDiagnostic;
+            await _logger.WriteAsync("CorrectionDiscarded", metadata);
+            return;
+        }
+        if (!StillCurrent(requestSnapshot))
+        {
+            metadata["Result"] = "stale-after-key-wait";
             await _logger.WriteAsync("CorrectionDiscarded", metadata);
             return;
         }
 
         var replacement = result.Replacement.TrimEnd() + extracted.Trailing;
-        var mutationAttempts = 1;
-        var applied = _input.ReplacePreviousText(requestSnapshot.OriginalTargetText, replacement,
-            () => StillCurrent(requestSnapshot));
-        if (!applied)
-        {
-            await Task.Delay(80, cancellationToken);
-            if (StillCurrent(requestSnapshot) && _input.WaitForPhysicalKeysReleased())
+        var mutation = await SafeMutationRetry.RunAsync(
+            settings.InsertionRetryAttempts,
+            settings.InsertionRetryDelayMs,
+            () => SafeMutationRetry.CanAttempt(
+                () => StillCurrent(requestSnapshot), _input.WaitForPhysicalKeysReleased),
+            () =>
             {
-                mutationAttempts++;
-                applied = _input.ReplacePreviousText(requestSnapshot.OriginalTargetText, replacement,
+                var applied = _input.ReplacePreviousText(requestSnapshot.OriginalTargetText, replacement,
                     () => StillCurrent(requestSnapshot));
-            }
-        }
-        metadata["MutationAttempts"] = mutationAttempts;
-        if (!applied)
+                return new MutationAttempt<bool>(applied, _input.LastFailureDiagnostic);
+            },
+            applied => applied,
+            (_, diagnostic) => SendInputService.CanSafelyRetry(requestSnapshot.OriginalTargetText, diagnostic),
+            cancellationToken);
+        metadata["MutationAttempts"] = mutation.Attempts;
+        if (mutation.Diagnostics.Count > 0)
+            metadata["MutationDiagnostics"] = string.Join(" || ", mutation.Diagnostics);
+        if (!mutation.Succeeded)
         {
-            metadata["Result"] = "send-input-failed";
-            metadata["MutationDiagnostic"] = _input.LastFailureDiagnostic;
+            metadata["MutationStopReason"] = mutation.StopReason.ToString();
+            if (mutation.ShouldInvalidateTrackedText)
+            {
+                var invalidatedVersion = _clock.Increment();
+                _buffer.Invalidate(_foreground.GetCurrent(), invalidatedVersion);
+                metadata["BufferInvalidated"] = true;
+            }
+            metadata["Result"] = mutation.StopReason switch
+            {
+                MutationStopReason.CurrentnessLost => "insertion-currentness-lost",
+                MutationStopReason.AmbiguousMutation => "insertion-ambiguous",
+                _ => "send-input-failed"
+            };
             await _logger.WriteAsync("CorrectionFailed", metadata);
             ShowStatus(snapshot.Window.WindowHandle,
-                "The correction could not be inserted. Your text and cursor were restored.", true);
+                mutation.StopReason switch
+                {
+                    MutationStopReason.CurrentnessLost =>
+                        "Correction cancelled because new input, focus, or editor state changed.",
+                    MutationStopReason.AmbiguousMutation =>
+                        "The editor could not confirm whether the correction was inserted. Spellchecker stopped to avoid duplicating text.",
+                    _ => "The correction could not be inserted after safe retries."
+                },
+                true);
             return;
         }
 
@@ -291,6 +357,19 @@ public sealed class CorrectionCoordinator : IDisposable
             ["TargetLength"] = snapshot.BufferText.Length,
             ["Reason"] = reason
         });
+
+    private Task LogProviderFailureAsync(string eventName, Exception exception)
+    {
+        var metadata = new Dictionary<string, object?> { ["Type"] = exception.GetType().Name };
+        if (exception is ProviderUnavailableException provider)
+        {
+            metadata["HttpStatus"] = provider.StatusCode;
+            metadata["ProviderStatus"] = provider.ProviderStatus;
+            metadata["Retryable"] = provider.IsRetryable;
+            metadata["Reason"] = provider.Message;
+        }
+        return _logger.WriteAsync(eventName, metadata);
+    }
 
     public void Dispose()
     {

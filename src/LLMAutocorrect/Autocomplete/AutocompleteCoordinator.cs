@@ -7,6 +7,7 @@ using LLMAutocorrect.Input;
 using LLMAutocorrect.Logging;
 using LLMAutocorrect.Memory;
 using LLMAutocorrect.Models;
+using LLMAutocorrect.Providers;
 using LLMAutocorrect.Security;
 using LLMAutocorrect.Windows;
 
@@ -189,7 +190,7 @@ public sealed class AutocompleteCoordinator : IDisposable
         ShowSuggestions(snapshot, focus, candidates, false);
         await _logger.WriteAsync("AutocompleteCompleted", new Dictionary<string, object?>
         {
-            ["Provider"] = "Gemini", ["LatencyMs"] = stopwatch.ElapsedMilliseconds,
+            ["Provider"] = ProviderClient.DisplayName(settings.Provider), ["LatencyMs"] = stopwatch.ElapsedMilliseconds,
             ["ContextChars"] = context.Length, ["Candidates"] = candidates.Length, ["Shown"] = true
         });
     }
@@ -255,7 +256,8 @@ public sealed class AutocompleteCoordinator : IDisposable
             .Distinct(StringComparer.OrdinalIgnoreCase).Take(maximum).ToArray();
         if (candidates.Length == 0) return;
         ShowSuggestions(snapshot, focus, candidates, true);
-        await LogTerminalCompletedAsync("Gemini+History", stopwatch.ElapsedMilliseconds, currentCommand.Length, candidates.Length);
+        await LogTerminalCompletedAsync(ProviderClient.DisplayName(settings.Provider) + "+History",
+            stopwatch.ElapsedMilliseconds, currentCommand.Length, candidates.Length);
     }
 
     private async Task AcceptAllAsync()
@@ -278,9 +280,46 @@ public sealed class AutocompleteCoordinator : IDisposable
 
     private async Task InsertAsync(SuggestionState.StateData state, string inserted, string remaining)
     {
-        if (!_input.WaitForPhysicalKeysReleased() || !CanInsert(state)) { Dismiss(); return; }
+        if (!SafeMutationRetry.CanAttempt(() => CanInsert(state), _input.WaitForPhysicalKeysReleased))
+        {
+            Dismiss();
+            return;
+        }
         var contextBefore = _buffer.GetSnapshot().BufferText;
-        if (!_input.InsertText(inserted)) { Dismiss(); return; }
+        var mutation = await SafeMutationRetry.RunAsync(
+            _settings.Current.InsertionRetryAttempts,
+            _settings.Current.InsertionRetryDelayMs,
+            () => SafeMutationRetry.CanAttempt(() => CanInsert(state), _input.WaitForPhysicalKeysReleased),
+            () =>
+            {
+                var applied = _input.InsertText(inserted, () => CanInsert(state));
+                return new MutationAttempt<bool>(applied, _input.LastFailureDiagnostic);
+            },
+            applied => applied,
+            (_, diagnostic) => SendInputService.CanSafelyRetry(string.Empty, diagnostic),
+            CancellationToken.None);
+        if (!mutation.Succeeded)
+        {
+            await _logger.WriteAsync(state.IsTerminal
+                ? "TerminalAutocompleteInsertionFailed"
+                : "AutocompleteInsertionFailed", new Dictionary<string, object?>
+            {
+                ["Attempts"] = mutation.Attempts,
+                ["MutationStopReason"] = mutation.StopReason.ToString(),
+                ["MutationMayHaveOccurred"] = mutation.ShouldInvalidateTrackedText,
+                ["Diagnostic"] = string.Join(" || ", mutation.Diagnostics)
+            });
+            // If verification could not prove whether an insertion happened, stop
+            // trusting the in-memory suffix. The next physical character starts a
+            // fresh synchronized segment instead of risking a later bad edit.
+            if (mutation.ShouldInvalidateTrackedText)
+            {
+                var invalidatedVersion = _clock.Increment();
+                _buffer.Invalidate(_foreground.GetCurrent(), invalidatedVersion);
+            }
+            Dismiss();
+            return;
+        }
         var nextVersion = _clock.Increment();
         if (!_buffer.TryAppend(state.BufferVersion, inserted, nextVersion)) { Dismiss(); return; }
         if (remaining.Length == 0)
@@ -336,7 +375,8 @@ public sealed class AutocompleteCoordinator : IDisposable
         TerminalContext.IsTerminalProcess(processName, _settings.Current.TerminalProcesses);
 
     internal static bool FeatureEnabled(AppSettings settings, bool terminal) =>
-        !settings.PrivateMode && (terminal ? settings.TerminalAutocompleteEnabled : settings.AutocompleteEnabled);
+        ProviderEndpointPolicy.IsAllowedByPrivateMode(settings) &&
+        (terminal ? settings.TerminalAutocompleteEnabled : settings.AutocompleteEnabled);
 
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
     private static int CountWords(string value) => value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;

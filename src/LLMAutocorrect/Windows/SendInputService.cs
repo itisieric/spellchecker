@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Globalization;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
 using LLMAutocorrect.Input;
@@ -8,6 +9,7 @@ namespace LLMAutocorrect.Windows;
 internal enum TextReplacementResult
 {
     Applied,
+    Stale,
     TextChanged,
     ClipboardUnavailable,
     SelectionUnavailable,
@@ -27,6 +29,7 @@ public sealed class SendInputService
     private string? _lastFailureDiagnostic;
     public bool IsInjecting => Volatile.Read(ref _isInjecting) != 0;
     public string? LastFailureDiagnostic => Volatile.Read(ref _lastFailureDiagnostic);
+    public string PhysicalKeyDiagnostic => _physicalKeys.LastWaitDiagnostic;
 
     public SendInputService(PhysicalKeyState? physicalKeys = null) => _physicalKeys = physicalKeys ?? new PhysicalKeyState();
 
@@ -49,8 +52,25 @@ public sealed class SendInputService
                 Volatile.Write(ref _lastFailureDiagnostic, "stage=pre-commit stale");
                 return false;
             }
-            return ReplaceForElement(element, original, replacement, canCommit,
-                detail => Volatile.Write(ref _lastFailureDiagnostic, detail));
+            var diagnostics = new List<string>();
+            var depth = 0;
+            foreach (var candidate in ReplacementCandidates(element))
+            {
+                if (canCommit is not null && !canCommit())
+                {
+                    diagnostics.Add($"candidate={depth} stage=pre-commit-stale");
+                    break;
+                }
+                string? candidateDiagnostic = null;
+                if (ReplaceForElement(candidate, original, replacement, canCommit,
+                        detail => candidateDiagnostic = detail)) return true;
+                diagnostics.Add($"candidate={depth} class={SafeClassName(candidate)} " +
+                                (candidateDiagnostic ?? "stage=no-supported-edit-pattern"));
+                if (!FailureOccurredBeforeMutation(candidateDiagnostic)) break;
+                depth++;
+            }
+            Volatile.Write(ref _lastFailureDiagnostic, string.Join(" | ", diagnostics));
+            return false;
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
         {
@@ -61,17 +81,94 @@ public sealed class SendInputService
         finally { Interlocked.Exchange(ref _isInjecting, 0); }
     }
 
-    public bool InsertText(string text) => ReplacePreviousText(string.Empty, text);
+    public bool InsertText(string text, Func<bool>? canCommit = null) =>
+        ReplacePreviousText(string.Empty, text, canCommit);
+
+    internal static bool CanSafelyRetry(string original, string? diagnostic)
+    {
+        // Retry only when the failure occurred before mutation or the editor
+        // explicitly confirmed that the exact original selection survived a paste
+        // attempt. Merely having non-empty original text is not enough: a stale UIA
+        // provider could briefly report old text after an ambiguous paste.
+        return FailureOccurredBeforeMutation(diagnostic) ||
+               diagnostic?.Contains("original-selection-confirmed=True", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    internal static bool FailureOccurredBeforeMutation(string? diagnostic)
+    {
+        if (string.IsNullOrWhiteSpace(diagnostic)) return false;
+        if (diagnostic.Contains("mutationAttempted=False", StringComparison.OrdinalIgnoreCase) ||
+            diagnostic.Contains("refresh-exception", StringComparison.OrdinalIgnoreCase)) return true;
+        if (diagnostic.Contains("paste", StringComparison.OrdinalIgnoreCase) ||
+            diagnostic.Contains("verification", StringComparison.OrdinalIgnoreCase) ||
+            diagnostic.Contains("exception", StringComparison.OrdinalIgnoreCase)) return false;
+        return diagnostic.Contains("unavailable", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("readonly", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("selection", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("stale", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("suffix-mismatch", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("text-mismatch", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("refresh-target-not-found", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("range-short", StringComparison.OrdinalIgnoreCase) ||
+               diagnostic.Contains("no-supported-edit-pattern", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static IEnumerable<AutomationElement> ReplacementCandidates(AutomationElement focused)
+    {
+        yield return focused;
+        var current = focused;
+        for (var depth = 0; depth < 5; depth++)
+        {
+            current = TryGetParent(current);
+            if (current is null) yield break;
+            if (SupportsTextPattern(current)) yield return current;
+        }
+    }
+
+    private static AutomationElement? TryGetParent(AutomationElement element)
+    {
+        try { return TreeWalker.RawViewWalker.GetParent(element); }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static bool SupportsTextPattern(AutomationElement element)
+    {
+        try
+        {
+            if (element.Current.IsPassword) return false;
+            return element.TryGetCurrentPattern(TextPattern.Pattern, out _);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static string SafeClassName(AutomationElement element)
+    {
+        try { return (element.Current.ClassName ?? string.Empty).Replace(' ', '_'); }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return "unavailable";
+        }
+    }
 
     public bool ReplaceTextRange(AutomationElement element, TextPatternRange range, string original, string replacement)
         => ReplaceTextRangeDetailed(element, range, original, replacement) == TextReplacementResult.Applied;
 
     internal TextReplacementResult ReplaceTextRangeDetailed(AutomationElement element, TextPatternRange range,
         string original, string replacement)
-        => ReplaceTextRangeDetailed(element, range, original, replacement, out _);
+        => ReplaceTextRangeDetailed(element, range, original, replacement, null, out _);
 
     internal TextReplacementResult ReplaceTextRangeDetailed(AutomationElement element, TextPatternRange range,
         string original, string replacement, out string diagnostic)
+        => ReplaceTextRangeDetailed(element, range, original, replacement, null, out diagnostic);
+
+    internal TextReplacementResult ReplaceTextRangeDetailed(AutomationElement element, TextPatternRange range,
+        string original, string replacement, Func<bool>? canCommit, out string diagnostic)
     {
         diagnostic = "stage=not-started";
         Interlocked.Exchange(ref _isInjecting, 1);
@@ -80,8 +177,14 @@ public sealed class SendInputService
         TextPatternRange? originalSelection = null;
         var selectedByUs = false;
         var applied = false;
+        var mutationAttempted = false;
         try
         {
+            if (canCommit is not null && !canCommit())
+            {
+                diagnostic = "stage=manual-preflight-stale mutationAttempted=False";
+                return TextReplacementResult.Stale;
+            }
             if (element.Current.IsPassword || !element.TryGetCurrentPattern(TextPattern.Pattern, out var raw) ||
                 raw is not TextPattern textPattern)
             {
@@ -103,48 +206,90 @@ public sealed class SendInputService
                 return TextReplacementResult.ClipboardUnavailable;
             }
             selectedByUs = true;
-            if (!SelectRangeAndConfirm(element, pattern, range, NormalizeNewlines(original), null, true,
+            if (!SelectRangeAndConfirm(element, pattern, range, NormalizeNewlines(original), canCommit, true,
                     out diagnostic))
             {
-                if (TryReplaceWholeValue(element, original, replacement))
+                if (canCommit is not null && !canCommit())
+                {
+                    diagnostic = "stage=manual-selection-stale mutationAttempted=False";
+                    return TextReplacementResult.Stale;
+                }
+                if (TryReplaceWholeValue(element, original, replacement, canCommit))
                 {
                     applied = true;
                     diagnostic += " fallback=whole-value-applied";
                     return TextReplacementResult.Applied;
                 }
+                if (canCommit is not null && !canCommit())
+                {
+                    diagnostic = "stage=manual-whole-value-stale mutationAttempted=False";
+                    return TextReplacementResult.Stale;
+                }
                 return TextReplacementResult.SelectionUnavailable;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                diagnostic = "stage=manual-pre-first-mutation-stale mutationAttempted=False";
+                return TextReplacementResult.Stale;
             }
             var handle = GetFocusedHandle(element);
             var shortcutFirst = !IsNativeEditHandle(handle);
+            mutationAttempted = true;
             var firstPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
             if (firstPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
-            if (!SelectionMatches(pattern, NormalizeNewlines(original))) return TextReplacementResult.PasteFailed;
+            if (!SelectionMatches(pattern, NormalizeNewlines(original)))
+            {
+                diagnostic = "stage=first-paste-selection-lost mutation-ambiguous";
+                return TextReplacementResult.PasteFailed;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                diagnostic = "stage=after-first-mutation-currentness-lost mutation-ambiguous";
+                return TextReplacementResult.PasteFailed;
+            }
             // Some controls occasionally acknowledge WM_PASTE without consuming it.
             // Repeating the same method is safe only while the exact original range
             // remains selected.
             Thread.Sleep(15);
+            if (canCommit is not null && !canCommit())
+            {
+                diagnostic = "stage=before-retry-mutation-currentness-lost mutation-ambiguous";
+                return TextReplacementResult.PasteFailed;
+            }
             var retryPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
             if (retryPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
-            if (!SelectionMatches(pattern, NormalizeNewlines(original))) return TextReplacementResult.PasteFailed;
+            if (!SelectionMatches(pattern, NormalizeNewlines(original)))
+            {
+                diagnostic = "stage=retry-paste-selection-lost mutation-ambiguous";
+                return TextReplacementResult.PasteFailed;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                diagnostic = "stage=after-retry-mutation-currentness-lost mutation-ambiguous";
+                return TextReplacementResult.PasteFailed;
+            }
             var fallbackPaste = shortcutFirst ? handle != IntPtr.Zero && SendPaste(handle) : SendPasteShortcut();
             if (fallbackPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
+            diagnostic = "stage=fallback-paste-failed original-selection-confirmed=" +
+                         SelectionMatches(pattern, NormalizeNewlines(original));
             return TextReplacementResult.PasteFailed;
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
         {
-            diagnostic = $"stage=exception type={ex.GetType().Name} hresult={ex.HResult}";
+            diagnostic = $"stage=exception type={ex.GetType().Name} hresult={ex.HResult} " +
+                         $"mutationAttempted={mutationAttempted}";
             return TextReplacementResult.EditorUnavailable;
         }
         finally
@@ -170,17 +315,26 @@ public sealed class SendInputService
         if (element.TryGetCurrentPattern(TextPattern.Pattern, out _))
         {
             var valueFallbackAllowed = HasSingleCaret(element);
-            if (TryReplaceTextRange(element, original, replacement, canCommit, reportFailure)) return true;
+            string? textDiagnostic = null;
+            if (TryReplaceTextRange(element, original, replacement, canCommit,
+                    detail => textDiagnostic = detail)) return true;
             // Chromium and WebView editors can expose TextPattern while temporarily
             // refusing range selection. ValuePattern is a safe fallback only when
             // the complete value still ends with the exact expected suffix and there
             // was no active selection when replacement started.
             if (!valueFallbackAllowed)
             {
-                reportFailure?.Invoke("stage=value-fallback active-selection");
+                reportFailure?.Invoke($"text=[{textDiagnostic ?? "stage=text-range-unavailable"}] " +
+                                      "fallback=[stage=value-fallback active-selection]");
                 return false;
             }
-            return TryReplaceValue(element, original, replacement, canCommit, reportFailure);
+            string? valueDiagnostic = null;
+            var applied = TryReplaceValue(element, original, replacement, canCommit,
+                detail => valueDiagnostic = detail);
+            if (!applied)
+                reportFailure?.Invoke($"text=[{textDiagnostic ?? "stage=text-range-unavailable"}] " +
+                                      $"fallback=[{valueDiagnostic ?? "stage=value-range-unavailable"}]");
+            return applied;
         }
         return TryReplaceValue(element, original, replacement, canCommit, reportFailure);
     }
@@ -206,8 +360,20 @@ public sealed class SendInputService
         var nativeOriginal = MatchNativeNewlines(value, original);
         if (!value.EndsWith(nativeOriginal, StringComparison.Ordinal))
         {
-            reportFailure?.Invoke($"stage=value-suffix mismatch valueLength={value.Length} targetLength={nativeOriginal.Length}");
-            return false;
+            var actualSuffix = value.Length <= nativeOriginal.Length ? value : value[^nativeOriginal.Length..];
+            if (IsLeadingCaseOnlyDifference(nativeOriginal, actualSuffix))
+            {
+                // Some editors capitalize the first character without raising an input
+                // event. Reconcile only that one harmless difference; every remaining
+                // character must still match exactly before we touch the control.
+                nativeOriginal = actualSuffix;
+            }
+            else
+            {
+                reportFailure?.Invoke($"stage=value-suffix-mismatch valueLength={value.Length} " +
+                                      $"targetLength={nativeOriginal.Length} " + DescribeMismatch(nativeOriginal, actualSuffix));
+                return false;
+            }
         }
         var nativeReplacement = MatchNativeNewlines(value, replacement);
         var updated = value[..^nativeOriginal.Length] + nativeReplacement;
@@ -229,11 +395,23 @@ public sealed class SendInputService
     private static bool TryReplaceTextRange(AutomationElement element, string original, string replacement,
         Func<bool>? canCommit, Action<string>? reportFailure)
     {
-        if (!element.TryGetCurrentPattern(TextPattern.Pattern, out var raw) || raw is not TextPattern pattern) return false;
+        if (!element.TryGetCurrentPattern(TextPattern.Pattern, out var raw) || raw is not TextPattern pattern)
+        {
+            reportFailure?.Invoke("stage=text-pattern-unavailable");
+            return false;
+        }
         var selections = pattern.GetSelection();
-        if (selections.Length != 1) return false;
+        if (selections.Length != 1)
+        {
+            reportFailure?.Invoke($"stage=text-selection-count count={selections.Length}");
+            return false;
+        }
         var caret = selections[0];
-        if (caret.CompareEndpoints(TextPatternRangeEndpoint.Start, caret, TextPatternRangeEndpoint.End) != 0) return false;
+        if (caret.CompareEndpoints(TextPatternRangeEndpoint.Start, caret, TextPatternRangeEndpoint.End) != 0)
+        {
+            reportFailure?.Invoke("stage=text-selection-active");
+            return false;
+        }
         var originalCaret = caret.Clone();
         var range = caret.Clone();
         var normalizedOriginal = NormalizeNewlines(original);
@@ -243,8 +421,27 @@ public sealed class SendInputService
         if (normalizedOriginal.Length > 0)
         {
             var moved = range.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -normalizedOriginal.Length);
-            if (moved != -normalizedOriginal.Length) return false;
-            if (!string.Equals(NormalizeNewlines(range.GetText(-1)), normalizedOriginal, StringComparison.Ordinal)) return false;
+            if (moved != -normalizedOriginal.Length)
+            {
+                reportFailure?.Invoke($"stage=text-range-short moved={moved} expected={-normalizedOriginal.Length}");
+                return false;
+            }
+            var rangeText = NormalizeNewlines(range.GetText(-1));
+            if (!string.Equals(rangeText, normalizedOriginal, StringComparison.Ordinal))
+            {
+                if (IsLeadingCaseOnlyDifference(normalizedOriginal, rangeText))
+                {
+                    normalizedOriginal = rangeText;
+                    fullOriginal = rangeText;
+                }
+                else
+                {
+                    reportFailure?.Invoke($"stage=text-suffix-mismatch actualLength={rangeText.Length} " +
+                                          $"targetLength={normalizedOriginal.Length} " +
+                                          DescribeMismatch(normalizedOriginal, rangeText));
+                    return false;
+                }
+            }
         }
 
         // Keep an Enter-generated paragraph marker in place when both strings end
@@ -255,14 +452,26 @@ public sealed class SendInputService
         if (preservedNewlines > 0)
         {
             var moved = range.MoveEndpointByUnit(TextPatternRangeEndpoint.End, TextUnit.Character, -preservedNewlines);
-            if (moved != -preservedNewlines) return false;
+            if (moved != -preservedNewlines)
+            {
+                reportFailure?.Invoke("stage=text-newline-range-short");
+                return false;
+            }
             normalizedOriginal = normalizedOriginal[..^preservedNewlines];
             normalizedReplacement = normalizedReplacement[..^preservedNewlines];
-            if (!string.Equals(NormalizeNewlines(range.GetText(-1)), normalizedOriginal, StringComparison.Ordinal)) return false;
+            if (!string.Equals(NormalizeNewlines(range.GetText(-1)), normalizedOriginal, StringComparison.Ordinal))
+            {
+                reportFailure?.Invoke("stage=text-newline-suffix-mismatch");
+                return false;
+            }
         }
         var valueVerification = CreateSuffixValueVerification(element, fullOriginal, fullReplacement,
             normalizedReplacement);
-        if (canCommit is not null && !canCommit()) return false;
+        if (canCommit is not null && !canCommit())
+        {
+            reportFailure?.Invoke("stage=text-pre-commit-stale");
+            return false;
+        }
         var handle = GetFocusedHandle(element);
 
         if (normalizedReplacement.Length == 0)
@@ -290,8 +499,16 @@ public sealed class SendInputService
         var mutationApplied = false;
         try
         {
-            if (!TryPrepareClipboard(normalizedReplacement, out clipboard)) return false;
-            if (canCommit is not null && !canCommit()) return false;
+            if (!TryPrepareClipboard(normalizedReplacement, out clipboard))
+            {
+                reportFailure?.Invoke("stage=clipboard-unavailable");
+                return false;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                reportFailure?.Invoke("stage=text-pre-selection-stale");
+                return false;
+            }
             selectedByUs = true;
             // Some Chromium/WebView providers accept Range.Select without actually
             // selecting the requested text. Pasting in that state appends the
@@ -301,6 +518,11 @@ public sealed class SendInputService
                     out var selectionDiagnostic))
             {
                 reportFailure?.Invoke(selectionDiagnostic);
+                return false;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                reportFailure?.Invoke("stage=text-pre-first-mutation-stale mutationAttempted=False");
                 return false;
             }
             var shortcutFirst = !IsNativeEditHandle(handle);
@@ -315,12 +537,22 @@ public sealed class SendInputService
             // Chromium address bars expose a TextPattern range but ignore WM_PASTE.
             // Only fall back to a real paste chord if the original selection is still
             // intact, so a partial edit can never be duplicated.
-            if (!SelectionMatches(pattern, normalizedOriginal) || canCommit is not null && !canCommit())
+            if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                reportFailure?.Invoke("stage=first-paste selection-lost-or-stale");
+                reportFailure?.Invoke("stage=first-paste-selection-lost mutation-ambiguous");
+                return false;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                reportFailure?.Invoke("stage=after-first-mutation-currentness-lost mutation-ambiguous");
                 return false;
             }
             Thread.Sleep(15);
+            if (canCommit is not null && !canCommit())
+            {
+                reportFailure?.Invoke("stage=before-retry-mutation-currentness-lost mutation-ambiguous");
+                return false;
+            }
             var retryPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
             if (retryPaste && VerifyInsertedText(pattern, normalizedReplacement, valueVerification))
             {
@@ -328,15 +560,21 @@ public sealed class SendInputService
                 RestoreCaretAfterPreservedNewlines(pattern, preservedNewlines);
                 return true;
             }
-            if (!SelectionMatches(pattern, normalizedOriginal) || canCommit is not null && !canCommit())
+            if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                reportFailure?.Invoke("stage=retry-paste selection-lost-or-stale");
+                reportFailure?.Invoke("stage=retry-paste-selection-lost mutation-ambiguous");
+                return false;
+            }
+            if (canCommit is not null && !canCommit())
+            {
+                reportFailure?.Invoke("stage=after-retry-mutation-currentness-lost mutation-ambiguous");
                 return false;
             }
             var fallbackPaste = shortcutFirst ? handle != IntPtr.Zero && SendPaste(handle) : SendPasteShortcut();
             if (!fallbackPaste || !VerifyInsertedText(pattern, normalizedReplacement, valueVerification))
             {
-                reportFailure?.Invoke("stage=fallback-paste verification-failed");
+                reportFailure?.Invoke("stage=fallback-paste verification-failed original-selection-confirmed=" +
+                                      SelectionMatches(pattern, normalizedOriginal));
                 return false;
             }
             mutationApplied = true;
@@ -437,7 +675,8 @@ public sealed class SendInputService
         }
     }
 
-    internal static bool TryReplaceWholeValue(AutomationElement element, string original, string replacement)
+    internal static bool TryReplaceWholeValue(AutomationElement element, string original, string replacement,
+        Func<bool>? canCommit = null)
     {
         if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var raw) || raw is not ValuePattern pattern ||
             pattern.Current.IsReadOnly) return false;
@@ -445,6 +684,7 @@ public sealed class SendInputService
         var nativeOriginal = MatchNativeNewlines(current, original);
         if (!string.Equals(current, nativeOriginal, StringComparison.Ordinal)) return false;
         var nativeReplacement = MatchNativeNewlines(current, replacement);
+        if (canCommit is not null && !canCommit()) return false;
         pattern.SetValue(nativeReplacement);
         if (!string.Equals(pattern.Current.Value, nativeReplacement, StringComparison.Ordinal)) return false;
         TryMoveValueCaretToEnd(element);
@@ -606,6 +846,57 @@ public sealed class SendInputService
 
     private static string NormalizeNewlines(string value) =>
         value.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
+    internal static string DescribeMismatch(string expected, string actual)
+    {
+        var prefix = 0;
+        while (prefix < expected.Length && prefix < actual.Length && expected[prefix] == actual[prefix]) prefix++;
+        var suffix = 0;
+        while (suffix < expected.Length - prefix && suffix < actual.Length - prefix &&
+               expected[^(suffix + 1)] == actual[^(suffix + 1)]) suffix++;
+        var expectedKind = prefix < expected.Length ? CharacterKind(expected[prefix]) : "end-of-text";
+        var actualKind = prefix < actual.Length ? CharacterKind(actual[prefix]) : "end-of-text";
+        var caseEquivalent = string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase)
+            .ToString().ToLowerInvariant();
+        return $"mismatchIndex={prefix} commonSuffix={suffix} expectedKind={expectedKind} actualKind={actualKind} " +
+               $"caseEquivalent={caseEquivalent}";
+    }
+
+    internal static bool IsLeadingCaseOnlyDifference(string expected, string actual)
+    {
+        if (expected.Length == 0 || expected.Length != actual.Length || expected[0] == actual[0]) return false;
+        if (!expected.AsSpan(1).SequenceEqual(actual.AsSpan(1))) return false;
+
+        var expectedFirst = expected[0];
+        var actualFirst = actual[0];
+        if (!char.IsLetter(expectedFirst) || !char.IsLetter(actualFirst)) return false;
+        var oppositeCase = char.IsUpper(expectedFirst) && char.IsLower(actualFirst) ||
+                           char.IsLower(expectedFirst) && char.IsUpper(actualFirst);
+        return oppositeCase && char.ToUpperInvariant(expectedFirst) == char.ToUpperInvariant(actualFirst) &&
+               char.ToLowerInvariant(expectedFirst) == char.ToLowerInvariant(actualFirst);
+    }
+
+    private static string CharacterKind(char value)
+    {
+        if (value == ' ') return "space";
+        if (value == '\u00A0') return "nonbreaking-space";
+        if (value is '\r' or '\n') return "line-break";
+        if (char.IsWhiteSpace(value)) return "other-whitespace";
+        return CharUnicodeInfo.GetUnicodeCategory(value) switch
+        {
+            UnicodeCategory.Format => "format-marker",
+            UnicodeCategory.ConnectorPunctuation or UnicodeCategory.DashPunctuation or
+                UnicodeCategory.OpenPunctuation or UnicodeCategory.ClosePunctuation or
+                UnicodeCategory.InitialQuotePunctuation or UnicodeCategory.FinalQuotePunctuation or
+                UnicodeCategory.OtherPunctuation => "punctuation",
+            UnicodeCategory.DecimalDigitNumber or UnicodeCategory.LetterNumber or UnicodeCategory.OtherNumber => "number",
+            UnicodeCategory.UppercaseLetter or UnicodeCategory.LowercaseLetter or UnicodeCategory.TitlecaseLetter or
+                UnicodeCategory.ModifierLetter or UnicodeCategory.OtherLetter => "letter",
+            UnicodeCategory.NonSpacingMark or UnicodeCategory.SpacingCombiningMark or UnicodeCategory.EnclosingMark =>
+                "combining-mark",
+            _ => "other"
+        };
+    }
 
     internal static IReadOnlyList<uint> BuildMessagePlan(int characterCount, bool includePaste)
     {

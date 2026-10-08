@@ -19,7 +19,7 @@ public partial class App : System.Windows.Application
     private InputRuntime? _runtime;
     private TrayIconManager? _tray;
     private SettingsWindow? _settingsWindow;
-    private GeminiClient? _geminiClient;
+    private ProviderClient? _providerClient;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -62,10 +62,11 @@ public partial class App : System.Windows.Application
             var history = new CorrectionHistory();
             var statusOverlay = new StatusOverlay();
             var caret = new CaretPositionService();
-            _geminiClient = new GeminiClient();
-            var correctionProvider = new GeminiCorrectionProvider(_geminiClient, settings);
-            var autocompleteProvider = new GeminiAutocompleteProvider(_geminiClient, settings);
-            var terminalAutocompleteProvider = new GeminiTerminalAutocompleteProvider(_geminiClient, settings);
+            var secretStore = new WindowsProviderSecretStore();
+            _providerClient = new ProviderClient(settings, secretStore);
+            var correctionProvider = new AiCorrectionProvider(_providerClient, settings);
+            var autocompleteProvider = new AiAutocompleteProvider(_providerClient, settings);
+            var terminalAutocompleteProvider = new AiTerminalAutocompleteProvider(_providerClient, settings);
 
             var correction = new CorrectionCoordinator(correctionProvider, settings, dictionary, protectedTokens,
                 correctionValidator, exclusions, foreground, focused, sendInput, buffer, clock, history, memory,
@@ -77,7 +78,8 @@ public partial class App : System.Windows.Application
                 new SuggestionState(), overlay, memory, commandHistory, logger);
             var manualOffer = new ManualCorrectionOverlay();
             var manualCorrection = new ManualCorrectionService(correctionProvider, settings, dictionary, protectedTokens,
-                correctionValidator, exclusions, foreground, focused, sendInput, memory, spellingHistory, manualOffer, statusOverlay, logger);
+                correctionValidator, exclusions, foreground, focused, sendInput, memory, spellingHistory, manualOffer,
+                statusOverlay, logger, clock);
             correction.Completed += autocomplete.Schedule;
 
             _runtime = new InputRuntime(keyboard, mouse, foreground, focused, buffer, clock,
@@ -86,15 +88,20 @@ public partial class App : System.Windows.Application
 
             var startup = new StartupManager();
             _settingsWindow = new SettingsWindow(settings, dictionary, memory, spellingHistory,
-                commandHistory, logger, startup);
+                commandHistory, logger, startup, secretStore, _providerClient);
             _tray = new TrayIconManager(settings, () => _settingsWindow,
                 () => _ = Task.Run(() => correction.UndoLatestAsync()),
                 manualCorrection.OfferCurrent,
                 () => Dispatcher.BeginInvoke(new Action(Shutdown)));
             await logger.WriteAsync("ApplicationStarted", new Dictionary<string, object?>
             {
-                ["Model"] = settings.Current.GeminiModel,
-                ["ApiKeyConfigured"] = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY"))
+                ["Provider"] = settings.Current.Provider.ToString(),
+                ["Model"] = settings.Current.ActiveProvider.Model,
+                ["EndpointIsLocal"] = ProviderEndpointPolicy.TryValidate(settings.Current.ActiveProvider.Endpoint,
+                    out var endpoint, out _) && ProviderEndpointPolicy.IsSameComputer(endpoint),
+                ["CredentialConfigured"] = secretStore.Contains(settings.Current.Provider) ||
+                    (settings.Current.Provider == AiProviderKind.Gemini &&
+                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY")))
             });
             if (e.Args.Contains("--shutdown-smoke", StringComparer.Ordinal))
             {
@@ -114,7 +121,7 @@ public partial class App : System.Windows.Application
         _tray?.Dispose();
         _settingsWindow?.Close();
         if (_runtime is not null) _runtime.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        _geminiClient?.Dispose();
+        _providerClient?.Dispose();
         if (_ownsMutex) _mutex?.ReleaseMutex();
         _mutex?.Dispose();
         base.OnExit(e);

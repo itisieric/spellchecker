@@ -10,7 +10,8 @@ public sealed record CorrectionRequest(
     CorrectionMode Mode,
     string CustomInstructions = "",
     bool PreserveCapitalizationAndPunctuation = false,
-    IReadOnlyList<string>? LearnedSpelling = null);
+    IReadOnlyList<string>? LearnedSpelling = null,
+    bool StrictReplacementOnly = false);
 
 public sealed record CorrectionResult(
     bool ShouldReplace,

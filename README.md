@@ -1,6 +1,6 @@
 # LLM Autocorrect for Windows
 
-A conservative Windows 11 tray application that uses Gemini to correct recently typed text and offer optional Tab-completion in ordinary Windows text fields. It is built with C#, .NET 8, WPF, UI Automation, and low-level Win32 hooks.
+A conservative Windows 11 tray application that uses a selectable local or paid AI provider to correct recently typed text and offer optional Tab-completion in ordinary Windows text fields. Ollama with `qwen3.5:4b` is the local-first default. The app is built with C#, .NET 8, WPF, UI Automation, and low-level Win32 hooks.
 
 The safety rule is simple: when focus, caret position, application, password status, or input version is uncertain, the app does nothing.
 
@@ -10,10 +10,12 @@ The safety rule is simple: when focus, caret position, application, password sta
 - In-memory typing buffer; ordinary typed text and full messages are not persisted.
 - Foreground window, process, and focused UI Automation element tracking.
 - Immediate hook-time version increments for stale-response rejection.
-- Gemini correction provider behind `ICorrectionProvider`.
-- Gemini autocomplete provider behind `IAutocompleteProvider`.
-- Low-thinking Gemini requests for latency-sensitive correction and completion.
-- Structured JSON responses, reusable `HttpClient`, cancellation, rate limits, and ten-second timeout.
+- Provider-neutral correction, regular autocomplete, and terminal autocomplete behind stable interfaces.
+- Native Ollama structured-output requests plus OpenAI-compatible and Gemini protocols.
+- Saved profiles for Ollama, LM Studio, Gemini, and a generic paid or local OpenAI-compatible service.
+- Provider addresses may use localhost, a trusted LAN host, or HTTPS cloud APIs.
+- API keys and tokens are stored in Windows Credential Manager and never in `settings.json`.
+- Structured JSON responses, reusable `HttpClient`, cancellation, rate limits, and a two-minute cold-load timeout for local models.
 - Protected URL, email, path, IP, number, unit, code identifier, and equipment identifier validation.
 - Conservative edit-distance and length validation.
 - Exact-suffix UI Automation replacement, with a unique marker on the limited injected-key fallback used by Chromium-style controls.
@@ -28,6 +30,8 @@ The safety rule is simple: when focus, caret position, application, password sta
 - Manual spelling correction for highlighted text or the word under a right-click, plus a `Ctrl+Alt+C` fallback.
 - A ranked Excel spelling-history workbook that groups attempted misspellings under the corrected word.
 - One automatic retry for an uncertain or temporarily failed correction, with an optional non-focus-stealing explanation popup.
+- Configurable stale-safe insertion retries. Every retry reacquires the focused editor and rechecks the window, input version, caret context, original text, and released physical keys before changing anything.
+- Autocomplete retries only failures proven to occur before insertion; ambiguous paste results stop and invalidate the tracked suffix to prevent duplicate text.
 - Deliberate provider latency setting for stale-response testing.
 - Physical-key release gating prevents accepted suggestions from being injected while Tab or a modifier is still held.
 
@@ -36,29 +40,34 @@ The safety rule is simple: when focus, caret position, application, password sta
 - Windows 11 x64
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) to build
 - .NET 8 Windows Desktop Runtime to run a framework-dependent build
-- A Gemini API key
+- Ollama for Windows and `qwen3.5:4b` for the default local configuration, or credentials for another configured provider
 
 The app runs as the current user. It intentionally does not request administrator privileges and therefore will not interact with elevated applications or the Windows secure desktop.
 
-## API key setup
+## AI provider setup
 
-The key is read only from the `GEMINI_API_KEY` environment variable. It is never saved in `settings.json`, source, or logs.
-
-Recommended setup:
-
-1. Open **Start → Edit environment variables for your account**.
-2. Add a user variable named `GEMINI_API_KEY` with the key as its value.
-3. Sign out and back in, or restart the terminal/Explorer process that launches the app.
-
-For a temporary PowerShell session:
+The default provider is Ollama on this computer. After installing Ollama, download the model once:
 
 ```powershell
-$env:GEMINI_API_KEY = Read-Host 'Gemini API key'
+ollama pull qwen3.5:4b
 ```
 
-Then start the application from that same session. Avoid placing a real key in scripts, `.env` files, command history, screenshots, or issue reports. If a key has been pasted into chat or another shared location, rotate it in Google AI Studio and configure the replacement.
+The initial profile uses `http://127.0.0.1:11434`, model `qwen3.5:4b`, and a 4096-token context. Open **Settings > AI Provider** to test the connection or select another saved profile:
 
-The default model is `gemini-3.5-flash-lite` for lower-latency correction. It is editable under **Settings → AI Provider** in case the model name available to the account differs.
+- **Ollama** uses the native `/api/chat` endpoint and can keep the model loaded.
+- **LM Studio** uses its OpenAI-compatible endpoint, normally `http://127.0.0.1:1234/v1`.
+- **Gemini** uses Google's cloud API and an API key.
+- **OpenAICompatible** supports local or paid services that implement `/v1/chat/completions` and structured JSON output.
+
+Each profile retains its own address, model, authentication type, HTTP header, optional prefix, context length, and keep-loaded preference. A blank credential box preserves the existing saved credential. Selecting **Clear saved credential** removes it from Windows Credential Manager.
+
+The first Ollama correction may take substantially longer while Windows loads the model into memory. Leave **Keep model loaded** enabled for low-latency follow-up corrections; turn it off when you prefer to reclaim GPU memory between uses.
+
+Gemini and generic OpenAI-compatible profiles can still read `GEMINI_API_KEY` and `OPENAI_API_KEY` respectively when no credential is saved. Avoid placing real keys in scripts, `.env` files, command history, screenshots, or issue reports. Rotate any credential that has been exposed.
+
+For a provider on another computer, enter a LAN address such as `http://192.168.1.50:11434`. The remote server must listen on its LAN interface and its firewall must permit only the intended private network. Plain HTTP does not encrypt correction text or tokens; use HTTPS or a trusted VPN when authentication or sensitive text crosses the network. Never expose an unauthenticated model server directly to the internet.
+
+**Private Mode** permits only a provider reached through this computer's loopback address. It blocks LAN and cloud endpoints both in the UI coordinators and immediately before a network request.
 
 ## Build and test
 
@@ -104,7 +113,7 @@ The app starts in the system tray. Autocorrect defaults to Conservative mode. Au
 
 Tab is intercepted only while a current, focus-matched suggestion is visible. Otherwise the target application receives Tab normally. When the overlay shows multiple options, press Alt+Down to move to the next option, then Tab to accept the displayed option.
 
-Ordinary settings live in `%APPDATA%\LLMAutocorrect\settings.json`. Dictionary terms live one-per-line in `%APPDATA%\LLMAutocorrect\dictionary.txt`. Personal memory lives in `%APPDATA%\LLMAutocorrect\memory.json`. Ranked spelling history is written to `%APPDATA%\LLMAutocorrect\spelling-history.xlsx`. Diagnostics are metadata-only at `%APPDATA%\LLMAutocorrect\logs\diagnostics.log`.
+Ordinary settings live in `%APPDATA%\LLMAutocorrect\settings.json`. Provider secrets live separately in Windows Credential Manager under `LLMAutocorrect/AIProvider/...`. Dictionary terms live one-per-line in `%APPDATA%\LLMAutocorrect\dictionary.txt`. Personal memory lives in `%APPDATA%\LLMAutocorrect\memory.json`. Ranked spelling history is written to `%APPDATA%\LLMAutocorrect\spelling-history.xlsx`. Diagnostics are metadata-only at `%APPDATA%\LLMAutocorrect\logs\diagnostics.log`.
 
 Personal memory learns a short continuation only after you explicitly accept it with Tab or Ctrl+Right. It also learns recurring spelling corrections after the same correction succeeds more than once. Phrase prefixes and original misspellings are stored as SHA-256 hashes rather than readable text; only the short accepted continuation or corrected spelling is retained. Sensitive-looking text, text containing digits, and long passages are not saved. You can disable learning or permanently erase the memory under **Settings → Memory**.
 
@@ -128,11 +137,11 @@ InputVersionClock ──► TypingBuffer / focus snapshot
           │                       │
           │                       ├──► CorrectionCoordinator
           │                       │         └──► ICorrectionProvider
-          │                       │                 └──► GeminiCorrectionProvider
+          │                       │                 └──► AiCorrectionProvider
           │                       │
           │                       └──► AutocompleteCoordinator
           │                                 └──► IAutocompleteProvider
-          │                                         └──► GeminiAutocompleteProvider
+          │                                         └──► AiAutocompleteProvider
           ▼
 Freshness + focus + password + exclusion + output validation
           │
@@ -140,7 +149,7 @@ Freshness + focus + password + exclusion + output validation
           └──► No-activate overlay → explicit acceptance → verified insertion
 ```
 
-Gemini code knows nothing about hooks or replacement. A future Ollama, llama.cpp, LM Studio, vLLM, or OpenAI-compatible provider can implement the same correction/autocomplete interfaces and be selected during composition without changing the Windows input system.
+Provider protocol code knows nothing about hooks or replacement. `ProviderClient` routes structured requests to Ollama's native API, an OpenAI-compatible endpoint, or Gemini without changing the Windows input system, output validation, or stale-response protection.
 
 ## Reliability and privacy behavior
 
@@ -152,7 +161,8 @@ Gemini code knows nothing about hooks or replacement. A future Ollama, llama.cpp
 - Password fields clear the buffer and suppress both providers. Password managers and login-related processes are excluded by default.
 - Context, requests, responses, unaccepted suggestions, and correction undo history remain in process memory. When personal memory is enabled, only the bounded, filtered learned entries described above are persisted.
 - Spelling history persists individual word pairs and counts only when its separate Memory-tab option is enabled.
-- Network/provider errors never block typing or show repeated dialogs.
+- Network/provider errors never block typing or show repeated dialogs. Permanent authentication, model, and billing errors are not retried automatically.
+- HTTP redirects are disabled for provider requests so an authentication token cannot be forwarded to a different host.
 
 ## Manual verification checklist
 
@@ -164,8 +174,9 @@ Gemini code knows nothing about hooks or replacement. A future Ollama, llama.cpp
 6. Show a suggestion, press Tab once, then press Tab again with no suggestion; verify normal application navigation on the second press.
 7. Verify Esc dismisses and Ctrl+Right accepts one word at a time.
 8. Verify a mouse click immediately hides a suggestion.
-9. Disconnect the network and verify typing remains uninterrupted with no dialog loop.
+9. Stop Ollama or disconnect the network and verify typing remains uninterrupted with no dialog loop and an actionable provider status.
 10. Use Ctrl+Alt+Z immediately after a correction and verify the original text returns only in the same control.
+11. In **Settings → AI Provider**, test Ollama, then switch to another saved profile and back; verify each profile retains its own model and endpoint.
 
 ## Known limitations
 
@@ -173,15 +184,15 @@ Gemini code knows nothing about hooks or replacement. A future Ollama, llama.cpp
 - `SendInput` can affect only applications at the same or lower integrity level. Elevated targets are intentionally unsupported.
 - The buffer tracks text typed after the latest safe synchronization point; it does not scrape an entire document or webpage.
 - Complex IME composition, dead-key layouts, rich-editor custom selection models, and application-native autocomplete require additional compatibility testing.
-- Live Gemini behavior is account/model dependent and is not exercised by the offline test runner.
-- Convenience features from the broader specification—notification toasts, timed pause menus, local-model UI, and fine-grained tray editing of application rules—are future work. Provider boundaries are already in place for local models.
+- Live model quality and latency depend on the selected model, quantization, context length, GPU availability, and provider runtime.
+- A remote Ollama or LM Studio server must be configured separately to listen on the LAN interface; the app does not change another server's bind address or firewall.
 
 ## Repository layout
 
 - `src/LLMAutocorrect/Input` — hooks, version clock, buffer, event worker
 - `src/LLMAutocorrect/Correction` — requests, validation, history, coordinator
 - `src/LLMAutocorrect/Autocomplete` — requests, validation, state, coordinator, overlay
-- `src/LLMAutocorrect/Providers` — Gemini REST implementations
+- `src/LLMAutocorrect/Providers` — Ollama, OpenAI-compatible, and Gemini protocol routing
 - `src/LLMAutocorrect/Windows` — UI Automation, foreground/caret, Win32 interop, `SendInput`
 - `src/LLMAutocorrect/Security` — exclusions, protected tokens, sensitive content
 - `src/LLMAutocorrect/Configuration` — settings and technical dictionary
