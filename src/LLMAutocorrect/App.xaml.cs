@@ -92,6 +92,17 @@ public partial class App : System.Windows.Application
             _tray = new TrayIconManager(settings, () => _settingsWindow,
                 () => _ = Task.Run(() => correction.UndoLatestAsync()),
                 manualCorrection.OfferCurrent,
+                async () =>
+                {
+                    var result = await _providerClient.ReleaseLocalOllamaResourcesAsync();
+                    await logger.WriteAsync("LocalModelResourceRelease", new Dictionary<string, object?>
+                    {
+                        ["Succeeded"] = result.Success,
+                        ["Available"] = result.IsAvailable
+                    });
+                    return result;
+                },
+                _providerClient.CanReleaseLocalOllamaResources,
                 () => Dispatcher.BeginInvoke(new Action(Shutdown)));
             await logger.WriteAsync("ApplicationStarted", new Dictionary<string, object?>
             {

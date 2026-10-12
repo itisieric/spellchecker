@@ -288,6 +288,7 @@ public sealed partial class ManualCorrectionService
                 var replacementDiagnostic = mutation.Diagnostics.Count == 0
                     ? "stage=safety-check-changed"
                     : string.Join(" || ", mutation.Diagnostics);
+                var automaticallyRecovered = mutation.Diagnostics.Any(SendInputService.RecoverySucceeded);
                 await _logger.WriteAsync("ManualCorrectionApplyFailed", new Dictionary<string, object?>
                 {
                     ["Process"] = target.Window.ProcessName,
@@ -296,11 +297,14 @@ public sealed partial class ManualCorrectionService
                     ["Attempts"] = mutation.Attempts,
                     ["MutationStopReason"] = effectiveStopReason.ToString(),
                     ["MutationMayHaveOccurred"] = mutation.ShouldInvalidateTrackedText,
+                    ["AutomaticRecovery"] = automaticallyRecovered,
                     ["Diagnostic"] = replacementDiagnostic,
                     ["ResponseRetryAttempted"] = responseRetryAttempted,
                     ["InitialValidation"] = initialValidation
                 });
-                ShowStatus(target, effectiveStopReason switch
+                ShowStatus(target, automaticallyRecovered
+                    ? "The correction failed, but Spellchecker automatically restored your original text."
+                    : effectiveStopReason switch
                 {
                     MutationStopReason.CurrentnessLost =>
                         "Correction cancelled because new input, focus, or editor state changed.",

@@ -94,6 +94,10 @@ public sealed class SendInputService
                diagnostic?.Contains("original-selection-confirmed=True", StringComparison.OrdinalIgnoreCase) == true;
     }
 
+    internal static bool RecoverySucceeded(string? diagnostic) =>
+        diagnostic?.Contains("recovery=automatic-undo-succeeded", StringComparison.OrdinalIgnoreCase) == true ||
+        diagnostic?.Contains("recovery=value-restore-succeeded", StringComparison.OrdinalIgnoreCase) == true;
+
     internal static bool FailureOccurredBeforeMutation(string? diagnostic)
     {
         if (string.IsNullOrWhiteSpace(diagnostic)) return false;
@@ -198,15 +202,19 @@ public sealed class SendInputService
                 diagnostic = "stage=initial-range text-mismatch";
                 return TextReplacementResult.TextChanged;
             }
+            var normalizedOriginal = NormalizeNewlines(original);
+            var normalizedReplacement = NormalizeNewlines(replacement);
+            var documentGuard = CreateDocumentMutationGuard(element, pattern, range, normalizedOriginal,
+                normalizedReplacement);
             var selections = pattern.GetSelection();
             if (selections.Length == 1) originalSelection = selections[0].Clone();
-            if (!TryPrepareClipboard(NormalizeNewlines(replacement), out clipboard))
+            if (!TryPrepareClipboard(normalizedReplacement, out clipboard))
             {
                 diagnostic = "stage=clipboard unavailable";
                 return TextReplacementResult.ClipboardUnavailable;
             }
             selectedByUs = true;
-            if (!SelectRangeAndConfirm(element, pattern, range, NormalizeNewlines(original), canCommit, true,
+            if (!SelectRangeAndConfirm(element, pattern, range, normalizedOriginal, canCommit, true,
                     out diagnostic))
             {
                 if (canCommit is not null && !canCommit())
@@ -233,22 +241,31 @@ public sealed class SendInputService
                 return TextReplacementResult.Stale;
             }
             var handle = GetFocusedHandle(element);
+            if (!IsNativeEditHandle(handle) && documentGuard is null)
+            {
+                diagnostic = "stage=document-mutation-guard-unavailable mutationAttempted=False";
+                return TextReplacementResult.SelectionUnavailable;
+            }
             var shortcutFirst = !IsNativeEditHandle(handle);
             mutationAttempted = true;
             var firstPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
-            if (firstPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
+            if (firstPaste && VerifyInsertedText(pattern, normalizedReplacement, null, documentGuard))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
-            if (!SelectionMatches(pattern, NormalizeNewlines(original)))
+            if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                diagnostic = "stage=first-paste-selection-lost mutation-ambiguous";
+                diagnostic = "stage=first-paste-selection-lost mutation-ambiguous " +
+                             TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit,
+                                 originalSelection ?? range);
                 return TextReplacementResult.PasteFailed;
             }
             if (canCommit is not null && !canCommit())
             {
-                diagnostic = "stage=after-first-mutation-currentness-lost mutation-ambiguous";
+                diagnostic = "stage=after-first-mutation-currentness-lost mutation-ambiguous " +
+                             TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit,
+                                 originalSelection ?? range);
                 return TextReplacementResult.PasteFailed;
             }
             // Some controls occasionally acknowledge WM_PASTE without consuming it.
@@ -261,14 +278,16 @@ public sealed class SendInputService
                 return TextReplacementResult.PasteFailed;
             }
             var retryPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
-            if (retryPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
+            if (retryPaste && VerifyInsertedText(pattern, normalizedReplacement, null, documentGuard))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
-            if (!SelectionMatches(pattern, NormalizeNewlines(original)))
+            if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                diagnostic = "stage=retry-paste-selection-lost mutation-ambiguous";
+                diagnostic = "stage=retry-paste-selection-lost mutation-ambiguous " +
+                             TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit,
+                                 originalSelection ?? range);
                 return TextReplacementResult.PasteFailed;
             }
             if (canCommit is not null && !canCommit())
@@ -277,13 +296,15 @@ public sealed class SendInputService
                 return TextReplacementResult.PasteFailed;
             }
             var fallbackPaste = shortcutFirst ? handle != IntPtr.Zero && SendPaste(handle) : SendPasteShortcut();
-            if (fallbackPaste && VerifyInsertedText(pattern, NormalizeNewlines(replacement)))
+            if (fallbackPaste && VerifyInsertedText(pattern, normalizedReplacement, null, documentGuard))
             {
                 applied = true;
                 return TextReplacementResult.Applied;
             }
             diagnostic = "stage=fallback-paste-failed original-selection-confirmed=" +
-                         SelectionMatches(pattern, NormalizeNewlines(original));
+                         SelectionMatches(pattern, normalizedOriginal) + " " +
+                         TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit,
+                             originalSelection ?? range);
             return TextReplacementResult.PasteFailed;
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
@@ -385,7 +406,8 @@ public sealed class SendInputService
         pattern.SetValue(updated);
         if (!string.Equals(pattern.Current.Value, updated, StringComparison.Ordinal))
         {
-            reportFailure?.Invoke("stage=value-verification mismatch");
+            var recovery = TryRestoreValueAfterUnexpectedMutation(pattern, value, updated, canCommit);
+            reportFailure?.Invoke($"stage=value-verification mismatch {recovery}");
             return false;
         }
         TryMoveValueCaretToEnd(element);
@@ -467,6 +489,7 @@ public sealed class SendInputService
         }
         var valueVerification = CreateSuffixValueVerification(element, fullOriginal, fullReplacement,
             normalizedReplacement);
+        var documentGuard = CreateDocumentMutationGuard(element, pattern, range, normalizedOriginal, normalizedReplacement);
         if (canCommit is not null && !canCommit())
         {
             reportFailure?.Invoke("stage=text-pre-commit-stale");
@@ -499,6 +522,11 @@ public sealed class SendInputService
         var mutationApplied = false;
         try
         {
+            if (!IsNativeEditHandle(handle) && valueVerification is null && documentGuard is null)
+            {
+                reportFailure?.Invoke("stage=document-mutation-guard-unavailable mutationAttempted=False");
+                return false;
+            }
             if (!TryPrepareClipboard(normalizedReplacement, out clipboard))
             {
                 reportFailure?.Invoke("stage=clipboard-unavailable");
@@ -527,7 +555,7 @@ public sealed class SendInputService
             }
             var shortcutFirst = !IsNativeEditHandle(handle);
             var firstPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
-            if (firstPaste && VerifyInsertedText(pattern, normalizedReplacement, valueVerification))
+            if (firstPaste && VerifyInsertedText(pattern, normalizedReplacement, valueVerification, documentGuard))
             {
                 mutationApplied = true;
                 RestoreCaretAfterPreservedNewlines(pattern, preservedNewlines);
@@ -539,7 +567,8 @@ public sealed class SendInputService
             // intact, so a partial edit can never be duplicated.
             if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                reportFailure?.Invoke("stage=first-paste-selection-lost mutation-ambiguous");
+                reportFailure?.Invoke("stage=first-paste-selection-lost mutation-ambiguous " +
+                                      TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit, originalCaret));
                 return false;
             }
             if (canCommit is not null && !canCommit())
@@ -554,7 +583,7 @@ public sealed class SendInputService
                 return false;
             }
             var retryPaste = shortcutFirst ? SendPasteShortcut() : handle != IntPtr.Zero && SendPaste(handle);
-            if (retryPaste && VerifyInsertedText(pattern, normalizedReplacement, valueVerification))
+            if (retryPaste && VerifyInsertedText(pattern, normalizedReplacement, valueVerification, documentGuard))
             {
                 mutationApplied = true;
                 RestoreCaretAfterPreservedNewlines(pattern, preservedNewlines);
@@ -562,7 +591,8 @@ public sealed class SendInputService
             }
             if (!SelectionMatches(pattern, normalizedOriginal))
             {
-                reportFailure?.Invoke("stage=retry-paste-selection-lost mutation-ambiguous");
+                reportFailure?.Invoke("stage=retry-paste-selection-lost mutation-ambiguous " +
+                                      TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit, originalCaret));
                 return false;
             }
             if (canCommit is not null && !canCommit())
@@ -571,10 +601,11 @@ public sealed class SendInputService
                 return false;
             }
             var fallbackPaste = shortcutFirst ? handle != IntPtr.Zero && SendPaste(handle) : SendPasteShortcut();
-            if (!fallbackPaste || !VerifyInsertedText(pattern, normalizedReplacement, valueVerification))
+            if (!fallbackPaste || !VerifyInsertedText(pattern, normalizedReplacement, valueVerification, documentGuard))
             {
                 reportFailure?.Invoke("stage=fallback-paste verification-failed original-selection-confirmed=" +
-                                      SelectionMatches(pattern, normalizedOriginal));
+                                      SelectionMatches(pattern, normalizedOriginal) + " " +
+                                      TryRollbackUnexpectedDocumentMutation(documentGuard, canCommit, originalCaret));
                 return false;
             }
             mutationApplied = true;
@@ -686,7 +717,11 @@ public sealed class SendInputService
         var nativeReplacement = MatchNativeNewlines(current, replacement);
         if (canCommit is not null && !canCommit()) return false;
         pattern.SetValue(nativeReplacement);
-        if (!string.Equals(pattern.Current.Value, nativeReplacement, StringComparison.Ordinal)) return false;
+        if (!string.Equals(pattern.Current.Value, nativeReplacement, StringComparison.Ordinal))
+        {
+            TryRestoreValueAfterUnexpectedMutation(pattern, current, nativeReplacement, canCommit);
+            return false;
+        }
         TryMoveValueCaretToEnd(element);
         // Win over a delayed Range.Select request from a Chromium/WebView provider.
         Thread.Sleep(75);
@@ -729,14 +764,16 @@ public sealed class SendInputService
         if (!element.TryGetCurrentPattern(ValuePattern.Pattern, out var raw) || raw is not ValuePattern valuePattern ||
             valuePattern.Current.IsReadOnly) return null;
         var before = valuePattern.Current.Value;
-        var normalizedBefore = NormalizeNewlines(before);
-        if (!normalizedBefore.EndsWith(original, StringComparison.Ordinal)) return null;
-        var expected = normalizedBefore[..^original.Length] + replacement;
-        return new ValueVerification(element, valuePattern, MatchNativeNewlines(before, expected),
-            MatchNativeNewlines(before, normalizedBefore + pastedReplacement));
+        var nativeOriginal = MatchNativeNewlines(before, original);
+        if (!before.EndsWith(nativeOriginal, StringComparison.Ordinal)) return null;
+        var prefix = before[..^nativeOriginal.Length];
+        return new ValueVerification(element, valuePattern,
+            prefix + MatchNativeNewlines(before, replacement),
+            before + MatchNativeNewlines(before, pastedReplacement));
     }
 
-    private static bool VerifyInsertedText(TextPattern pattern, string expected, ValueVerification? valueVerification = null)
+    private static bool VerifyInsertedText(TextPattern pattern, string expected,
+        ValueVerification? valueVerification = null, DocumentMutationGuard? documentGuard = null)
     {
         if (expected.Length == 0) return true;
         var deadline = Environment.TickCount64 + 250;
@@ -745,7 +782,9 @@ public sealed class SendInputService
             if (valueVerification is not null)
             {
                 var current = valueVerification.Pattern.Current.Value;
-                if (string.Equals(current, valueVerification.Expected, StringComparison.Ordinal)) return true;
+                if (string.Equals(current, valueVerification.Expected, StringComparison.Ordinal) &&
+                    (documentGuard is null || DocumentTextEquals(documentGuard.Pattern, documentGuard.Expected)))
+                    return true;
                 // A few WebView editors report the range as selected but still
                 // append on paste. Repair only the exact, unambiguous duplicate;
                 // any concurrent user edit makes this comparison fail.
@@ -756,10 +795,13 @@ public sealed class SendInputService
                             StringComparison.Ordinal))
                     {
                         TryMoveValueCaretToEnd(valueVerification.Element);
-                        return true;
+                        if (documentGuard is null || DocumentTextEquals(documentGuard.Pattern, documentGuard.Expected))
+                            return true;
                     }
                 }
             }
+            if (documentGuard is not null && DocumentTextEquals(documentGuard.Pattern, documentGuard.Expected))
+                return true;
             var selections = pattern.GetSelection();
             if (selections.Length == 1)
             {
@@ -770,7 +812,7 @@ public sealed class SendInputService
                     var moved = inserted.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -expected.Length);
                     if (moved == -expected.Length &&
                         string.Equals(NormalizeNewlines(inserted.GetText(-1)), expected, StringComparison.Ordinal) &&
-                        valueVerification is null) return true;
+                        valueVerification is null && documentGuard is null) return true;
                 }
             }
             if (Environment.TickCount64 >= deadline) return false;
@@ -780,6 +822,104 @@ public sealed class SendInputService
 
     private sealed record ValueVerification(AutomationElement Element, ValuePattern Pattern, string Expected,
         string Duplicated);
+
+    private sealed record DocumentMutationGuard(AutomationElement Element, TextPattern Pattern, string Before,
+        string Expected);
+
+    private static DocumentMutationGuard? CreateDocumentMutationGuard(AutomationElement element, TextPattern pattern,
+        TextPatternRange range, string selectedText, string replacement)
+    {
+        try
+        {
+            var document = pattern.DocumentRange;
+            var before = NormalizeNewlines(document.GetText(-1));
+            if (before.Length > 20_000) return null;
+            var prefixRange = document.Clone();
+            prefixRange.MoveEndpointByRange(TextPatternRangeEndpoint.End, range, TextPatternRangeEndpoint.Start);
+            var suffixRange = document.Clone();
+            suffixRange.MoveEndpointByRange(TextPatternRangeEndpoint.Start, range, TextPatternRangeEndpoint.End);
+            var prefix = NormalizeNewlines(prefixRange.GetText(-1));
+            var suffix = NormalizeNewlines(suffixRange.GetText(-1));
+            if (!string.Equals(before, prefix + selectedText + suffix, StringComparison.Ordinal)) return null;
+            return new(element, pattern, before, prefix + replacement + suffix);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static bool DocumentTextEquals(TextPattern pattern, string expected)
+    {
+        try
+        {
+            return string.Equals(NormalizeNewlines(pattern.DocumentRange.GetText(-1)), expected,
+                StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static string TryRollbackUnexpectedDocumentMutation(DocumentMutationGuard? guard,
+        Func<bool>? canCommit, TextPatternRange originalCaret)
+    {
+        if (guard is null) return "recovery=guard-unavailable";
+        if (DocumentTextEquals(guard.Pattern, guard.Before)) return "recovery=not-needed";
+        if (DocumentTextEquals(guard.Pattern, guard.Expected)) return "recovery=expected-present";
+        if (canCommit is not null && !canCommit()) return "recovery=skipped-currentness-lost";
+        var handle = GetFocusedHandle(guard.Element);
+        var undoSent = handle != IntPtr.Zero && IsNativeEditHandle(handle)
+            ? SendMessage(handle, NativeMethods.WmUndo, UIntPtr.Zero)
+            : SendUndoShortcut();
+        if (!undoSent) return "recovery=undo-send-failed";
+
+        var deadline = Environment.TickCount64 + 300;
+        do
+        {
+            if (DocumentTextEquals(guard.Pattern, guard.Before))
+            {
+                try { originalCaret.Select(); }
+                catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException) { }
+                return "recovery=automatic-undo-succeeded";
+            }
+            if (canCommit is not null && !canCommit()) return "recovery=undo-unconfirmed-currentness-lost";
+            if (Environment.TickCount64 >= deadline) return "recovery=automatic-undo-unconfirmed";
+            Thread.Sleep(10);
+        } while (true);
+    }
+
+    internal static string TryRestoreValueAfterUnexpectedMutation(ValuePattern pattern, string before, string expected,
+        Func<bool>? canCommit)
+    {
+        var current = pattern.Current.Value;
+        if (string.Equals(current, before, StringComparison.Ordinal)) return "recovery=not-needed";
+        if (string.Equals(current, expected, StringComparison.Ordinal)) return "recovery=expected-present";
+        if (canCommit is not null && !canCommit()) return "recovery=skipped-currentness-lost";
+        try
+        {
+            pattern.SetValue(before);
+            return string.Equals(pattern.Current.Value, before, StringComparison.Ordinal)
+                ? "recovery=value-restore-succeeded"
+                : "recovery=value-restore-unconfirmed";
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or ArgumentException)
+        {
+            return $"recovery=value-restore-exception-{ex.GetType().Name}";
+        }
+    }
+
+    internal static string TryRollbackDocumentForTest(AutomationElement element, string before, string expected)
+    {
+        if (!element.TryGetCurrentPattern(TextPattern.Pattern, out var raw) || raw is not TextPattern pattern)
+            return "recovery=test-text-pattern-unavailable";
+        var selections = pattern.GetSelection();
+        if (selections.Length != 1) return "recovery=test-selection-unavailable";
+        return TryRollbackUnexpectedDocumentMutation(
+            new DocumentMutationGuard(element, pattern, NormalizeNewlines(before), NormalizeNewlines(expected)),
+            null, selections[0].Clone());
+    }
 
     private static bool RestoreCaretAfterPreservedNewlines(TextPattern pattern, int newlineCount)
     {
@@ -925,6 +1065,17 @@ public sealed class SendInputService
             Create((ushort)NativeMethods.VkControl, 0, 0),
             Create((ushort)NativeMethods.VkV, 0, 0),
             Create((ushort)NativeMethods.VkV, 0, NativeMethods.KeyeventfKeyup),
+            Create((ushort)NativeMethods.VkControl, 0, NativeMethods.KeyeventfKeyup)
+        ]);
+    }
+
+    private static bool SendUndoShortcut()
+    {
+        return SendInputBatch(
+        [
+            Create((ushort)NativeMethods.VkControl, 0, 0),
+            Create((ushort)NativeMethods.VkZ, 0, 0),
+            Create((ushort)NativeMethods.VkZ, 0, NativeMethods.KeyeventfKeyup),
             Create((ushort)NativeMethods.VkControl, 0, NativeMethods.KeyeventfKeyup)
         ]);
     }

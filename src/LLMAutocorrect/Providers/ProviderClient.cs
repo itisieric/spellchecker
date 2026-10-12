@@ -14,6 +14,7 @@ public interface IJsonGenerationClient
 }
 
 public sealed record ProviderConnectionTestResult(bool Success, string Message);
+public sealed record LocalModelResourceReleaseResult(bool Success, bool IsAvailable, string Message);
 
 public interface IProviderConnectionTester
 {
@@ -100,6 +101,41 @@ public sealed class ProviderClient : IJsonGenerationClient, IProviderConnectionT
         catch (JsonException) { return new(false, "The provider responded, but its model list was not valid JSON."); }
     }
 
+    public bool CanReleaseLocalOllamaResources()
+    {
+        if (_settings.Current.Provider != AiProviderKind.Ollama) return false;
+        return ProviderEndpointPolicy.TryValidate(_settings.Current.OllamaProvider.Endpoint, out var endpoint, out _) &&
+               ProviderEndpointPolicy.IsSameComputer(endpoint);
+    }
+
+    public async Task<LocalModelResourceReleaseResult> ReleaseLocalOllamaResourcesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (!CanReleaseLocalOllamaResources())
+            return new(false, false,
+                "This control is available only while Ollama is selected at a local address on this computer.");
+
+        var profile = _settings.Current.OllamaProvider.Clone();
+        ProviderEndpointPolicy.TryValidate(profile.Endpoint, out var endpoint, out _);
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, Append(endpoint, "api/generate"))
+            {
+                // Ollama treats keep_alive: 0 as an unload request. No text is
+                // supplied, so this is not a correction or generation request.
+                Content = JsonContent.Create(new { model = profile.Model, keep_alive = 0 })
+            };
+            using var response = await SendAsync(request, AiProviderKind.Ollama, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return new(false, true, CreateFailure(AiProviderKind.Ollama, response).UserMessage);
+            return new(true, true, "Local Ollama model unloaded. GPU memory and RAM were released.");
+        }
+        catch (ProviderUnavailableException ex)
+        {
+            return new(false, true, ex.UserMessage);
+        }
+    }
+
     private async Task<JsonDocument> GenerateGeminiAsync(AiProviderSettings profile, Uri endpoint, string? secret,
         string systemInstruction, object payload, object schema, CancellationToken cancellationToken)
     {
@@ -121,7 +157,7 @@ public sealed class ProviderClient : IJsonGenerationClient, IProviderConnectionT
             stream = false,
             think = false,
             format = NormalizeSchema(schema),
-            keep_alive = profile.KeepModelLoaded ? (object)(-1) : "5m",
+            keep_alive = OllamaKeepAlive(profile, endpoint),
             options = new
             {
                 temperature = 0,
@@ -280,6 +316,13 @@ public sealed class ProviderClient : IJsonGenerationClient, IProviderConnectionT
         new { role = "system", content = systemInstruction },
         new { role = "user", content = JsonSerializer.Serialize(payload) }
     ];
+
+    private object OllamaKeepAlive(AiProviderSettings profile, Uri endpoint)
+    {
+        if (_settings.Current.ReleaseLocalModelResources && ProviderEndpointPolicy.IsSameComputer(endpoint))
+            return 0;
+        return profile.KeepModelLoaded ? -1 : "5m";
+    }
 
     internal static JsonElement NormalizeSchema(object schema)
     {

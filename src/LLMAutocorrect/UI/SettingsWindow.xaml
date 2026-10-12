@@ -90,7 +90,7 @@
             <TextBox x:Name="InsertionRetryAttemptsText" Width="120" HorizontalAlignment="Left" />
             <TextBlock Margin="0,6,0,0" Foreground="Gray" TextWrapping="Wrap"
                        Text="A retry runs only if the same window, editor, cursor context, input version, and original text can be verified again. Set attempts to 0 to disable insertion retries." />
-            <CheckBox x:Name="AddressBarSpellingOnlyCheck" Margin="0,18,0,0" Content="Browser address bars: spelling only (preserve capitalization and punctuation)" />
+            <CheckBox x:Name="AddressBarSpellingOnlyCheck" Margin="0,18,0,0" Content="Browser address bars: spelling only (preserve capitalization and sentence punctuation; allow contraction apostrophes)" />
             <CheckBox x:Name="UncertainNotificationCheck" Margin="0,10,0,0" Content="Show a small message when a correction is uncertain or rejected for safety" />
             <CheckBox x:Name="SuccessNotificationCheck" Margin="0,10,0,0" Content="Show a small message after a successful correction" />
             <TextBlock Text="Custom correction instructions" Margin="0,18,0,4" />

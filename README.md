@@ -24,10 +24,12 @@ The safety rule is simple: when focus, caret position, application, password sta
 - Non-activating autocomplete overlay with Tab accept, Esc dismiss, Ctrl+Right partial accept, and Alt+Down candidate cycling.
 - Password-field, sensitive-topic, terminal, IDE, password-manager, and per-application exclusion gates.
 - Private Mode, metadata-only diagnostics, editable technical dictionary, settings UI, tray controls, and startup registration.
-- Global custom correction instructions plus a browser-address-bar spelling-only profile that preserves capitalization and punctuation.
+- Global custom correction instructions plus a browser-address-bar spelling-only profile that preserves capitalization and sentence punctuation while allowing contraction apostrophes.
 - Privacy-conscious personal memory for explicitly accepted completions and recurring spelling corrections, with a disable switch and Clear Memory control.
 - Technical dictionary terms are sent to autocomplete only when already present in the current context, so a saved term cannot steer an unrelated suggestion.
 - Manual spelling correction for highlighted text or the word under a right-click, plus a `Ctrl+Alt+C` fallback.
+- Verified editor mutations with automatic undo when a paste unexpectedly changes or erases text and the exact pre-edit document can still be restored safely.
+- Metadata-only per-stage correction timing (`ScheduleDelayMs`, `PreflightMs`, `ThrottleWaitMs`, `ProviderMs`, `ValidationMs`, `CommitGuardMs`, `KeyReleaseWaitMs`, and `MutationMs`) for performance diagnosis.
 - A ranked Excel spelling-history workbook that groups attempted misspellings under the corrected word.
 - One automatic retry for an uncertain or temporarily failed correction, with an optional non-focus-stealing explanation popup.
 - Configurable stale-safe insertion retries. Every retry reacquires the focused editor and rechecks the window, input version, caret context, original text, and released physical keys before changing anything.
@@ -61,7 +63,7 @@ The initial profile uses `http://127.0.0.1:11434`, model `qwen3.5:4b`, and a 409
 
 Each profile retains its own address, model, authentication type, HTTP header, optional prefix, context length, and keep-loaded preference. A blank credential box preserves the existing saved credential. Selecting **Clear saved credential** removes it from Windows Credential Manager.
 
-The first Ollama correction may take substantially longer while Windows loads the model into memory. Leave **Keep model loaded** enabled for low-latency follow-up corrections; turn it off when you prefer to reclaim GPU memory between uses.
+The first Ollama correction may take substantially longer while Windows loads the model into memory. Leave **Keep model loaded** enabled for low-latency follow-up corrections. To immediately free GPU memory and RAM, right-click the tray icon and check **Free local Ollama model resources**. It is off by default; while checked it unloads the local Ollama model immediately and after each request. Uncheck it when you want the model kept warm again. The tray control is deliberately unavailable for LAN Ollama and LM Studio, because the app cannot safely issue a generic model-unload command to those providers.
 
 Gemini and generic OpenAI-compatible profiles can still read `GEMINI_API_KEY` and `OPENAI_API_KEY` respectively when no credential is saved. Avoid placing real keys in scripts, `.env` files, command history, screenshots, or issue reports. Rotate any credential that has been exposed.
 

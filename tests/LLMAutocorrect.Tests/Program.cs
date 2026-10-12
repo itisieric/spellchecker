@@ -28,10 +28,13 @@ if (args.Contains("--editor-message-smoke", StringComparer.Ordinal))
     return RunEditorMessageSmoke();
 if (args.Contains("--uia-replacement-smoke", StringComparer.Ordinal))
     return RunUiaReplacementSmoke();
+if (args.Contains("--recovery-smoke", StringComparer.Ordinal))
+    return RunRecoverySmoke();
 
 var tests = new (string Name, Action Run)[]
 {
     ("minimal correction accepted", MinimalCorrectionAccepted),
+    ("model no-op replacement rejected", ModelNoOpRejected),
     ("protected identifier change rejected", ProtectedIdentifierRejected),
     ("number change rejected", NumberChangeRejected),
     ("large rewrite rejected", LargeRewriteRejected),
@@ -57,8 +60,11 @@ var tests = new (string Name, Action Run)[]
     ("provider client enforces private mode before network access", ProviderClientEnforcesPrivateMode),
     ("provider schema is normalized for local engines", ProviderSchemaIsNormalized),
     ("Ollama correction uses structured local request", OllamaCorrectionUsesStructuredRequest),
+    ("local model release uses Ollama unload request", LocalOllamaModelRelease),
+    ("resource release mode unloads only local Ollama requests", ResourceReleaseModeIsLocalOnly),
     ("OpenAI-compatible provider sends protected bearer token", OpenAiProviderUsesBearerToken),
     ("provider settings migration retains Gemini and selects Ollama", ProviderSettingsMigration),
+    ("resource release migration preserves the selected provider", ResourceReleaseMigrationPreservesProvider),
     ("provider credentials are not serialized with settings", ProviderCredentialsAreNotSerialized),
     ("Gemini billing errors are actionable and not retried", GeminiBillingErrorsAreActionable),
     ("autocomplete dictionary terms require context", DictionaryTermsRequireContext),
@@ -104,6 +110,14 @@ static void MinimalCorrectionAccepted()
     var text = "the VFD dose not work";
     var request = new CorrectionRequest("", text, ["VFD"], detector.Detect(text, ["VFD"]), CorrectionMode.Conservative);
     Assert(validator.Validate(request, new(true, "The VFD does not work.", "spelling_grammar"), .4).IsValid);
+}
+
+static void ModelNoOpRejected()
+{
+    var (validator, detector) = CorrectionTools();
+    const string text = "already correct";
+    var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative);
+    Equal("no-change", validator.Validate(request, new(true, text, "spelling"), .4).Reason);
 }
 
 static void ProtectedIdentifierRejected()
@@ -171,7 +185,10 @@ static void AddressBarStylePreserved()
     var request = new CorrectionRequest("", text, [], detector.Detect(text, []), CorrectionMode.Conservative,
         "", PreserveCapitalizationAndPunctuation: true);
     Assert(validator.Validate(request, new(true, "now lets misspell", "spelling"), .4).IsValid);
+    Assert(validator.Validate(request, new(true, "now let's misspell", "spelling_grammar"), .4).IsValid);
+    Assert(validator.Validate(request, new(true, "now let\u2019s misspell", "spelling_grammar"), .4).IsValid);
     Assert(!validator.Validate(request, new(true, "Now let's misspell.", "spelling_grammar"), .4).IsValid);
+    Assert(!validator.Validate(request, new(true, "now let's, misspell", "spelling_grammar"), .4).IsValid);
 }
 
 static void ManualCorrectionPermitsOrdinaryPunctuation()
@@ -190,7 +207,9 @@ static void ManualCorrectionPermitsOrdinaryPunctuation()
     var addressBar = new FocusedControlIdentity("1.5", false, true, "Address and search bar", "address", "OmniboxViewViews");
     Assert(ManualCorrectionService.ShouldPreserveAddressBarStyle(settings, addressBar, "brave.exe"));
     var addressRequest = standardRequest with { PreserveCapitalizationAndPunctuation = true };
-    Equal("address-bar-style", validator.Validate(addressRequest, correction, .60).Reason);
+    Assert(validator.Validate(addressRequest, correction, .60).IsValid);
+    Equal("address-bar-style", validator.Validate(addressRequest,
+        correction with { Replacement = "Haven't typed." }, .60).Reason);
     Equal("Not corrected because address-bar spelling mode preserves capitalization and punctuation.",
         ManualCorrectionService.ValidationMessage("address-bar-style"));
 }
@@ -396,6 +415,44 @@ static void OllamaCorrectionUsesStructuredRequest()
     Assert(handler.Authorization is null);
 }
 
+static void LocalOllamaModelRelease()
+{
+    var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+    using var http = new HttpClient(handler);
+    var settings = new SettingsManager();
+    settings.Current.Provider = AiProviderKind.Ollama;
+    settings.Current.OllamaProvider = AiProviderDefaults.Create(AiProviderKind.Ollama);
+    using var client = new ProviderClient(settings, new MemorySecretStore(), http);
+    Assert(client.CanReleaseLocalOllamaResources());
+    var result = client.ReleaseLocalOllamaResourcesAsync().GetAwaiter().GetResult();
+    Assert(result.Success);
+    Equal("http://127.0.0.1:11434/api/generate", handler.RequestUri?.AbsoluteUri);
+    Assert(handler.RequestBody?.Contains("\"model\":\"qwen3.5:4b\"", StringComparison.Ordinal) == true);
+    Assert(handler.RequestBody?.Contains("\"keep_alive\":0", StringComparison.Ordinal) == true);
+}
+
+static void ResourceReleaseModeIsLocalOnly()
+{
+    var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StringContent("{\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"should_replace\\\":false,\\\"replacement\\\":\\\"\\\",\\\"change_type\\\":\\\"none\\\",\\\"uncertain\\\":false,\\\"reason\\\":\\\"\\\"}\"}}", Encoding.UTF8, "application/json")
+    });
+    using var http = new HttpClient(handler);
+    var settings = new SettingsManager();
+    settings.Current.Provider = AiProviderKind.Ollama;
+    settings.Current.ReleaseLocalModelResources = true;
+    using var client = new ProviderClient(settings, new MemorySecretStore(), http);
+    client.GenerateJsonAsync("test", new { value = "word" }, new { type = "OBJECT" }, CancellationToken.None)
+        .GetAwaiter().GetResult().Dispose();
+    Assert(handler.RequestBody?.Contains("\"keep_alive\":0", StringComparison.Ordinal) == true);
+
+    settings.Current.OllamaProvider.Endpoint = "http://192.168.1.50:11434";
+    client.GenerateJsonAsync("test", new { value = "word" }, new { type = "OBJECT" }, CancellationToken.None)
+        .GetAwaiter().GetResult().Dispose();
+    Assert(!client.CanReleaseLocalOllamaResources());
+    Assert(handler.RequestBody?.Contains("\"keep_alive\":-1", StringComparison.Ordinal) == true);
+}
+
 static void OpenAiProviderUsesBearerToken()
 {
     var handler = new RecordingHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
@@ -438,6 +495,23 @@ static void ProviderSettingsMigration()
         Equal(AiProviderKind.Ollama, manager.Current.Provider);
         Equal("qwen3.5:4b", manager.Current.OllamaProvider.Model);
         Equal("gemini-legacy-test", manager.Current.GeminiProvider.Model);
+        Equal(SettingsManager.CurrentSettingsVersion, manager.Current.SettingsVersion);
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void ResourceReleaseMigrationPreservesProvider()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"llm-autocorrect-settings-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        File.WriteAllText(Path.Combine(directory, "settings.json"),
+            "{\"settingsVersion\":6,\"provider\":\"Gemini\",\"releaseLocalModelResources\":true}");
+        var manager = new SettingsManager(directory);
+        manager.LoadAsync().GetAwaiter().GetResult();
+        Equal(AiProviderKind.Gemini, manager.Current.Provider);
+        Assert(!manager.Current.ReleaseLocalModelResources);
         Equal(SettingsManager.CurrentSettingsVersion, manager.Current.SettingsVersion);
     }
     finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
@@ -813,6 +887,11 @@ static void UnanchoredInsertionRetryPolicy()
     Assert(!SendInputService.CanSafelyRetry("original text", "stage=fallback-paste verification-failed"));
     Assert(SendInputService.CanSafelyRetry("original text",
         "stage=fallback-paste verification-failed original-selection-confirmed=True"));
+    Assert(SendInputService.RecoverySucceeded(
+        "stage=first-paste-selection-lost recovery=automatic-undo-succeeded"));
+    Assert(SendInputService.RecoverySucceeded(
+        "stage=value-verification mismatch recovery=value-restore-succeeded"));
+    Assert(!SendInputService.RecoverySucceeded("recovery=automatic-undo-unconfirmed"));
 }
 
 static void InsertionRetryDefaultsAreBounded()
@@ -1099,6 +1178,106 @@ static int RunEditorMessageSmoke()
     }
 
     static string NormalizeNewlines(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal);
+}
+
+static int RunRecoverySmoke()
+{
+    Forms.Form? form = null;
+    Forms.TextBox? textBox = null;
+    Exception? failure = null;
+    long[] mutationSamples = [];
+    using var ready = new ManualResetEventSlim();
+    var uiThread = new Thread(() =>
+    {
+        try
+        {
+            form = new Forms.Form { ShowInTaskbar = false, Width = 360, Height = 120 };
+            textBox = new Forms.TextBox { Dock = Forms.DockStyle.Fill };
+            form.Controls.Add(textBox);
+            form.Shown += (_, _) => ready.Set();
+            Forms.Application.Run(form);
+        }
+        catch (Exception ex) { failure = ex; ready.Set(); }
+    });
+    uiThread.SetApartmentState(ApartmentState.STA);
+    uiThread.Start();
+    if (!ready.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Recovery test editor did not start.");
+    if (failure is not null) throw failure;
+
+    var automationThread = new Thread(() =>
+    {
+        try
+        {
+            if (form is null || textBox is null) throw new InvalidOperationException("Recovery test controls unavailable.");
+            var handle = (IntPtr)form.Invoke(new Func<IntPtr>(() => textBox.Handle));
+            var element = System.Windows.Automation.AutomationElement.FromHandle(handle);
+            var valuePattern = (System.Windows.Automation.ValuePattern)element.GetCurrentPattern(
+                System.Windows.Automation.ValuePattern.Pattern);
+
+            form.Invoke(() => textBox.Text = "prefix was unexpectedly damaged");
+            valuePattern.SetValue("prefix was unexpectedly ");
+            var valueRecovery = SendInputService.TryRestoreValueAfterUnexpectedMutation(valuePattern,
+                "prefix was unexpectedly damaged", "prefix was unexpectedly corrected", () => true);
+            var restoredValue = (string)form.Invoke(new Func<string>(() => textBox.Text));
+            if (!string.Equals("recovery=value-restore-succeeded", valueRecovery, StringComparison.Ordinal) ||
+                !string.Equals("prefix was unexpectedly damaged", restoredValue, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Value recovery result={valueRecovery} value={ToCodePoints(restoredValue)}.");
+
+            var timings = new List<long>();
+            for (var iteration = 0; iteration < 10; iteration++)
+            {
+                form.Invoke(() =>
+                {
+                    textBox.Text = "this needs corection";
+                    textBox.SelectionStart = textBox.TextLength;
+                    textBox.SelectionLength = 0;
+                });
+                var mutationTimer = System.Diagnostics.Stopwatch.StartNew();
+                if (!SendInputService.ReplaceForElement(element, "this needs corection", "this needs correction"))
+                    throw new InvalidOperationException($"Timed replacement {iteration + 1} failed.");
+                mutationTimer.Stop();
+                timings.Add(mutationTimer.ElapsedMilliseconds);
+                var timedValue = (string)form.Invoke(new Func<string>(() => textBox.Text));
+                if (!string.Equals("this needs correction", timedValue, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Timed replacement {iteration + 1} produced {ToCodePoints(timedValue)}.");
+            }
+            mutationSamples = timings.ToArray();
+
+            const string erasedText = "everything I was writing";
+            form.Invoke(() =>
+            {
+                textBox.Text = erasedText;
+                textBox.SelectionStart = 0;
+                textBox.SelectionLength = textBox.TextLength;
+            });
+            if (!SendInputService.SendBackspaces(handle, 1))
+                throw new InvalidOperationException("The recovery test could not delete the selected text.");
+            var erasedValue = (string)form.Invoke(new Func<string>(() => textBox.Text));
+            if (erasedValue.Length != 0)
+                throw new InvalidOperationException($"The recovery test did not erase the selection: {ToCodePoints(erasedValue)}.");
+
+            var documentRecovery = SendInputService.TryRollbackDocumentForTest(element, erasedText,
+                "everything I was correcting");
+            var recoveredDocument = (string)form.Invoke(new Func<string>(() => textBox.Text));
+            if (!string.Equals("recovery=automatic-undo-succeeded", documentRecovery, StringComparison.Ordinal) ||
+                !string.Equals(erasedText, recoveredDocument, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Document recovery result={documentRecovery} value={ToCodePoints(recoveredDocument)}.");
+        }
+        catch (Exception ex) { failure = ex; }
+        finally { form?.BeginInvoke(form.Close); }
+    });
+    automationThread.SetApartmentState(ApartmentState.STA);
+    automationThread.Start();
+    if (!automationThread.Join(TimeSpan.FromSeconds(15))) throw new TimeoutException("Recovery smoke test timed out.");
+    uiThread.Join(TimeSpan.FromSeconds(10));
+    if (failure is not null) throw failure;
+    var ordered = mutationSamples.Order().ToArray();
+    var average = mutationSamples.Length == 0 ? 0 : mutationSamples.Average();
+    var median = ordered.Length == 0 ? 0 : ordered[ordered.Length / 2];
+    var maximum = ordered.Length == 0 ? 0 : ordered[^1];
+    Console.WriteLine($"RECOVERY_PASS exact value rollback and automatic undo restored deliberately erased text; " +
+                      $"mutation average={average:F1}ms median={median}ms max={maximum}ms samples=[{string.Join(',', mutationSamples)}]");
+    return 0;
 }
 
 static int RunUiaReplacementSmoke()

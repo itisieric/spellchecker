@@ -108,6 +108,8 @@ public sealed class CorrectionCoordinator : IDisposable
 
     private async Task ProcessAsync(TypingSnapshot snapshot, CancellationToken cancellationToken, bool isRetry)
     {
+        var processStarted = DateTimeOffset.UtcNow;
+        var pipeline = Stopwatch.StartNew();
         var settings = _settings.Current;
         if (!settings.Enabled) { await LogSkipAsync(snapshot, "disabled"); return; }
         if (!ProviderEndpointPolicy.IsAllowedByPrivateMode(settings))
@@ -132,34 +134,49 @@ public sealed class CorrectionCoordinator : IDisposable
         var addressBarStyle = settings.BrowserAddressBarSpellingOnly && focus.IsBrowserAddressBar(snapshot.Window.ProcessName);
         var request = new CorrectionRequest(extracted.Context, extracted.Target, _dictionary.Terms, protectedTokens,
             settings.Mode, settings.CustomCorrectionInstructions, addressBarStyle, _memory.GetSpellingHints(extracted.Target));
+        var preflightMs = pipeline.ElapsedMilliseconds;
 
         var interval = TimeSpan.FromMilliseconds(settings.MinimumRequestIntervalMs) - (DateTimeOffset.UtcNow - _lastRequest);
+        var throttle = Stopwatch.StartNew();
         if (interval > TimeSpan.Zero) await Task.Delay(interval, cancellationToken);
+        throttle.Stop();
         _lastRequest = DateTimeOffset.UtcNow;
         Interlocked.Exchange(ref _busy, 1);
-        var stopwatch = Stopwatch.StartNew();
+        long providerMs = 0;
+        long validationMs = 0;
         CorrectionResult result;
         CorrectionValidation? validation = null;
         var responseRetryAttempted = false;
         string? initialValidation = null;
         try
         {
+            var provider = Stopwatch.StartNew();
             result = await _provider.CorrectAsync(request, cancellationToken);
+            provider.Stop();
+            providerMs += provider.ElapsedMilliseconds;
             if (result.ShouldReplace)
             {
+                var validationTimer = Stopwatch.StartNew();
                 validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+                validationTimer.Stop();
+                validationMs += validationTimer.ElapsedMilliseconds;
                 if (CorrectionResponseRetry.ShouldRetry(validation, isRetry, StillCurrent(requestSnapshot)))
                 {
                     initialValidation = validation.Reason;
                     responseRetryAttempted = true;
                     request = CorrectionResponseRetry.CreateStrictRequest(request);
+                    provider.Restart();
                     result = await _provider.CorrectAsync(request, cancellationToken);
+                    provider.Stop();
+                    providerMs += provider.ElapsedMilliseconds;
+                    validationTimer.Restart();
                     validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+                    validationTimer.Stop();
+                    validationMs += validationTimer.ElapsedMilliseconds;
                 }
             }
         }
         finally { Interlocked.Exchange(ref _busy, 0); }
-        stopwatch.Stop();
 
         if (!result.ShouldReplace && result.Uncertain)
         {
@@ -180,11 +197,20 @@ public sealed class CorrectionCoordinator : IDisposable
             return;
         }
 
-        validation ??= _validator.Validate(request, result, settings.MaximumEditRatio);
+        if (validation is null)
+        {
+            var validationTimer = Stopwatch.StartNew();
+            validation = _validator.Validate(request, result, settings.MaximumEditRatio);
+            validationTimer.Stop();
+            validationMs += validationTimer.ElapsedMilliseconds;
+        }
         var metadata = new Dictionary<string, object?>
         {
             ["Process"] = snapshot.Window.ProcessName, ["TargetLength"] = extracted.Target.Length,
-            ["LatencyMs"] = stopwatch.ElapsedMilliseconds, ["EditRatio"] = validation.EditRatio.ToString("F3"),
+            ["LatencyMs"] = providerMs, ["ProviderMs"] = providerMs,
+            ["ScheduleDelayMs"] = Math.Max(0, (long)(processStarted - snapshot.Created).TotalMilliseconds),
+            ["PreflightMs"] = preflightMs, ["ThrottleWaitMs"] = throttle.ElapsedMilliseconds,
+            ["ValidationMs"] = validationMs, ["EditRatio"] = validation.EditRatio.ToString("F3"),
             ["Validation"] = validation.Reason,
             ["Style"] = addressBarStyle ? "address-bar-spelling" : "standard",
             ["ResponseRetryAttempted"] = responseRetryAttempted,
@@ -192,6 +218,7 @@ public sealed class CorrectionCoordinator : IDisposable
         };
         if (!validation.IsValid)
         {
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionRejected", metadata);
             if (validation.Reason is "edit-ratio" or "length" or "repeated-character-run")
                 ShowStatus(snapshot.Window.WindowHandle, "Correction skipped because the suggested edit was not safe.");
@@ -200,28 +227,40 @@ public sealed class CorrectionCoordinator : IDisposable
         // The model can finish at the exact moment the user resumes typing. Require
         // one final quiet window before touching the editor; any new key cancels this
         // scheduled correction and the newer snapshot gets its own request.
+        var commitGuard = Stopwatch.StartNew();
         await Task.Delay(settings.CorrectionCommitDelayMs, cancellationToken);
+        commitGuard.Stop();
+        metadata["CommitGuardMs"] = commitGuard.ElapsedMilliseconds;
         if (!StillCurrent(requestSnapshot))
         {
             metadata["Result"] = "stale-before-key-wait";
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionDiscarded", metadata);
             return;
         }
+        var keyRelease = Stopwatch.StartNew();
         if (!_input.WaitForPhysicalKeysReleased())
         {
+            keyRelease.Stop();
+            metadata["KeyReleaseWaitMs"] = keyRelease.ElapsedMilliseconds;
             metadata["Result"] = "physical-key-timeout";
             metadata["PhysicalKeyDiagnostic"] = _input.PhysicalKeyDiagnostic;
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionDiscarded", metadata);
             return;
         }
+        keyRelease.Stop();
+        metadata["KeyReleaseWaitMs"] = keyRelease.ElapsedMilliseconds;
         if (!StillCurrent(requestSnapshot))
         {
             metadata["Result"] = "stale-after-key-wait";
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionDiscarded", metadata);
             return;
         }
 
         var replacement = result.Replacement.TrimEnd() + extracted.Trailing;
+        var mutationTimer = Stopwatch.StartNew();
         var mutation = await SafeMutationRetry.RunAsync(
             settings.InsertionRetryAttempts,
             settings.InsertionRetryDelayMs,
@@ -236,12 +275,16 @@ public sealed class CorrectionCoordinator : IDisposable
             applied => applied,
             (_, diagnostic) => SendInputService.CanSafelyRetry(requestSnapshot.OriginalTargetText, diagnostic),
             cancellationToken);
+        mutationTimer.Stop();
+        metadata["MutationMs"] = mutationTimer.ElapsedMilliseconds;
         metadata["MutationAttempts"] = mutation.Attempts;
         if (mutation.Diagnostics.Count > 0)
             metadata["MutationDiagnostics"] = string.Join(" || ", mutation.Diagnostics);
         if (!mutation.Succeeded)
         {
+            var automaticallyRecovered = mutation.Diagnostics.Any(SendInputService.RecoverySucceeded);
             metadata["MutationStopReason"] = mutation.StopReason.ToString();
+            metadata["AutomaticRecovery"] = automaticallyRecovered;
             if (mutation.ShouldInvalidateTrackedText)
             {
                 var invalidatedVersion = _clock.Increment();
@@ -254,9 +297,12 @@ public sealed class CorrectionCoordinator : IDisposable
                 MutationStopReason.AmbiguousMutation => "insertion-ambiguous",
                 _ => "send-input-failed"
             };
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionFailed", metadata);
             ShowStatus(snapshot.Window.WindowHandle,
-                mutation.StopReason switch
+                automaticallyRecovered
+                    ? "The correction failed, but Spellchecker automatically restored your original text."
+                    : mutation.StopReason switch
                 {
                     MutationStopReason.CurrentnessLost =>
                         "Correction cancelled because new input, focus, or editor state changed.",
@@ -271,6 +317,7 @@ public sealed class CorrectionCoordinator : IDisposable
         var nextVersion = _clock.Increment();
         if (!_buffer.TryReplaceSuffix(requestSnapshot.BufferVersion, requestSnapshot.OriginalTargetText, replacement, nextVersion))
         {
+            AddFinalTimings(metadata, pipeline, snapshot);
             await _logger.WriteAsync("CorrectionBufferResync", metadata);
             _buffer.Invalidate(_foreground.GetCurrent(), _clock.Current);
             return;
@@ -278,6 +325,7 @@ public sealed class CorrectionCoordinator : IDisposable
         _history.Add(new(requestSnapshot.OriginalTargetText, replacement, requestSnapshot.WindowHandle,
             requestSnapshot.ProcessId, requestSnapshot.FocusedElementId, DateTimeOffset.UtcNow));
         metadata["Result"] = "applied";
+        AddFinalTimings(metadata, pipeline, snapshot);
         await _logger.WriteAsync("CorrectionCompleted", metadata);
         await _memory.RecordCorrectionAsync(extracted.Target, result.Replacement, protectedTokens);
         await _spellingHistory.RecordCorrectionAsync(extracted.Target, result.Replacement, protectedTokens);
@@ -286,6 +334,15 @@ public sealed class CorrectionCoordinator : IDisposable
             var pair = SpellingHistory.ExtractPairs(extracted.Target, result.Replacement, protectedTokens).FirstOrDefault();
             ShowStatus(snapshot.Window.WindowHandle, pair is null ? "Spelling corrected." : $"{pair.Misspelled} → {pair.Correct}", true);
         }
+    }
+
+    private static void AddFinalTimings(Dictionary<string, object?> metadata, Stopwatch pipeline,
+        TypingSnapshot snapshot)
+    {
+        pipeline.Stop();
+        metadata["PipelineMs"] = pipeline.ElapsedMilliseconds;
+        metadata["TotalSinceInputMs"] = Math.Max(0,
+            (long)(DateTimeOffset.UtcNow - snapshot.Created).TotalMilliseconds);
     }
 
     private bool StillCurrent(CorrectionSnapshot snapshot)

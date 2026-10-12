@@ -5,7 +5,7 @@ namespace LLMAutocorrect.Configuration;
 
 public sealed class SettingsManager
 {
-    internal const int CurrentSettingsVersion = 6;
+    internal const int CurrentSettingsVersion = 7;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -36,7 +36,8 @@ public sealed class SettingsManager
             await using (var stream = File.OpenRead(SettingsPath))
                 Current = await JsonSerializer.DeserializeAsync<AppSettings>(stream, JsonOptions, cancellationToken)
                           ?? new AppSettings();
-            if (Current.SettingsVersion < CurrentSettingsVersion)
+            var previousVersion = Current.SettingsVersion;
+            if (previousVersion < 6)
             {
                 if (string.Equals(Current.GeminiModel, "gemini-3.8-flash", StringComparison.OrdinalIgnoreCase))
                     Current.GeminiModel = "gemini-3.5-flash-lite";
@@ -51,6 +52,13 @@ public sealed class SettingsManager
                 // Keep a short final quiet period so typing that resumes while a
                 // request finishes cancels the correction before text is selected.
                 Current.CorrectionCommitDelayMs = 100;
+                migrationRequired = true;
+            }
+            // Version 7 adds a tray-controlled, opt-in release mode. Keeping it
+            // false preserves the existing low-latency behavior after upgrade.
+            if (previousVersion < 7) Current.ReleaseLocalModelResources = false;
+            if (previousVersion < CurrentSettingsVersion)
+            {
                 Current.SettingsVersion = CurrentSettingsVersion;
                 migrationRequired = true;
             }

@@ -17,6 +17,7 @@ internal static class NativeMethods
     internal const int WmRButtonUp = 0x0205;
     internal const int WmPaste = 0x0302;
     internal const int WmClear = 0x0303;
+    internal const int WmUndo = 0x0304;
     internal const int EmCharFromPos = 0x00D7;
     internal const int EmRichCharFromPos = 0x0427;
     internal const uint KeyeventfKeyup = 0x0002;

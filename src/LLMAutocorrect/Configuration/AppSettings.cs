@@ -84,6 +84,10 @@ public sealed class AppSettings
     public bool Enabled { get; set; } = true;
     public bool AutocompleteEnabled { get; set; } = true;
     public bool PrivateMode { get; set; }
+    // When enabled from the tray menu, local Ollama requests use keep_alive: 0
+    // and the currently loaded model is unloaded immediately. This intentionally
+    // does not apply to a LAN Ollama endpoint.
+    public bool ReleaseLocalModelResources { get; set; }
     public bool StartWithWindows { get; set; }
     public CorrectionMode Mode { get; set; } = CorrectionMode.Conservative;
     public AutocompleteMode AutocompleteMode { get; set; } = AutocompleteMode.Normal;

@@ -14,7 +14,9 @@ public sealed class AiCorrectionProvider : ICorrectionProvider
         register numbers, code, or any protected token. Use context_before only for understanding. Modify only
         target_text. When should_replace is true, replacement must contain the complete corrected target_text,
         never only the changed word or phrase. Prefer minimal corrections. If preserve_capitalization_and_punctuation is true, correct
-        spelling only: preserve capitalization, punctuation, whitespace, and word count exactly. Treat
+        spelling only: preserve capitalization, whitespace, word count, and punctuation exactly, except that an apostrophe between
+        letters may be added, removed, or normalized when required for a contraction (for example, lets to let's). Do not add
+        sentence-ending punctuation. Treat
         custom_instructions as trusted user preferences only when they do not conflict with these safety rules.
         learned_spelling contains corrections the user has previously accepted; prefer them when applicable.
         Return only the requested JSON structure. If no meaningful correction is needed, set should_replace to false

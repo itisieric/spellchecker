@@ -14,6 +14,8 @@ public sealed class CorrectionValidator
         if (!result.ShouldReplace) return new(false, 0, "no-change");
         var output = result.Replacement?.TrimEnd() ?? string.Empty;
         if (output.Length == 0) return new(false, 1, "empty");
+        if (string.Equals(output, request.TargetText.TrimEnd(), StringComparison.Ordinal))
+            return new(false, 0, "no-change");
         if (output.Contains("```", StringComparison.Ordinal) || output.Contains("Here is", StringComparison.OrdinalIgnoreCase))
             return new(false, 1, "explanation-or-markdown");
         if (HasSuspiciousRun(output) && !HasSuspiciousRun(request.TargetText))
@@ -64,7 +66,13 @@ public sealed class CorrectionValidator
 
     private static bool PreservesAddressBarStyle(string input, string output)
     {
-        static string Punctuation(string value) => new(value.Where(char.IsPunctuation).ToArray());
+        static bool IsApostrophe(char value) => value is '\'' or '\u2019';
+        static bool IsInWordApostrophe(string value, int index) =>
+            IsApostrophe(value[index]) && index > 0 && index + 1 < value.Length &&
+            char.IsLetter(value[index - 1]) && char.IsLetter(value[index + 1]);
+        static string Punctuation(string value) => new(value
+            .Where((character, index) => char.IsPunctuation(character) && !IsInWordApostrophe(value, index))
+            .ToArray());
         static string Whitespace(string value) => new(value.Where(char.IsWhiteSpace).ToArray());
         if (!string.Equals(Punctuation(input), Punctuation(output), StringComparison.Ordinal) ||
             !string.Equals(Whitespace(input), Whitespace(output), StringComparison.Ordinal)) return false;
