@@ -2,6 +2,7 @@ using LLMAutocorrect.Autocomplete;
 using LLMAutocorrect.Configuration;
 using LLMAutocorrect.Correction;
 using LLMAutocorrect.Input;
+using LLMAutocorrect.Logging;
 using LLMAutocorrect.Models;
 using LLMAutocorrect.Memory;
 using LLMAutocorrect.Providers;
@@ -15,6 +16,9 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 
+if (args.Length == 2 && args[0] == "--validate-provider-benchmark")
+    return ProviderBenchmarkValidation.Run(args[1]);
+
 if (args.Contains("--sendinput-smoke", StringComparer.Ordinal))
     return RunSendInputSmoke();
 if (args.Contains("--layout", StringComparer.Ordinal))
@@ -27,9 +31,9 @@ if (args.Contains("--layout", StringComparer.Ordinal))
 if (args.Contains("--editor-message-smoke", StringComparer.Ordinal))
     return RunEditorMessageSmoke();
 if (args.Contains("--uia-replacement-smoke", StringComparer.Ordinal))
-    return RunUiaReplacementSmoke();
+    return RunUiaReplacementSmoke(args.Contains("--wait-for-start", StringComparer.Ordinal));
 if (args.Contains("--recovery-smoke", StringComparer.Ordinal))
-    return RunRecoverySmoke();
+    return RunRecoverySmoke(args.Contains("--wait-for-start", StringComparer.Ordinal));
 
 var tests = new (string Name, Action Run)[]
 {
@@ -46,6 +50,8 @@ var tests = new (string Name, Action Run)[]
     ("sensitive topic detected", SensitiveTopic),
     ("browser address bar detected", BrowserAddressBarDetected),
     ("address bar style preserved", AddressBarStylePreserved),
+    ("application icon includes transparent high DPI frames", ApplicationIconTests.IncludesHighDpiFrames),
+    ("window icon is fully loaded and frozen", ApplicationIconTests.WindowIconIsLoadedAndFrozen),
     ("manual correction permits ordinary punctuation", ManualCorrectionPermitsOrdinaryPunctuation),
     ("replacement failures report the actual cause", ReplacementFailuresReportActualCause),
     ("manual correction popup avoids the pointer menu", ManualCorrectionPopupAvoidsPointerMenu),
@@ -84,10 +90,18 @@ var tests = new (string Name, Action Run)[]
     ,("safe insertion retry succeeds after transient failures", SafeInsertionRetrySucceeds)
     ,("safe insertion retry stops after typing Enter Backspace or cursor movement", SafeInsertionRetryStopsAfterInput)
     ,("safe insertion retry distinguishes ambiguous and exhausted failures", SafeInsertionRetryDistinguishesFailures)
+    ,("confirmed editor text changes stop before repeated insertion attempts", OriginalTextMismatchStopsRetry)
+    ,("typing resumes after a read-only editor mismatch without losing newer input", TypingResumesAfterEditorMismatch)
+    ,("editor typography matching accepts only narrow quote and initial-case differences", EditorTypographyMatchingIsNarrow)
+    ,("manual editor refresh failures retry without claiming an insertion", ManualRefreshFailuresAreBeforeMutation)
     ,("mutation currentness is rechecked after waiting for key release", MutationCurrentnessIsRecheckedAfterKeyWait)
     ,("unanchored autocomplete retries only before mutation", UnanchoredInsertionRetryPolicy)
     ,("insertion retry defaults are bounded", InsertionRetryDefaultsAreBounded)
     ,("text mismatch diagnostics do not log sentence content", TextMismatchDiagnosticsAreMetadataOnly)
+    ,("diagnostic request scopes survive awaits and remain isolated", DiagnosticScopesStayIsolated)
+    ,("diagnostics redact secrets and omit raw model or exception text", DiagnosticsProtectSensitiveContent)
+    ,("logging failure cannot turn an applied edit into a retry", DiagnosticsFailureIsNonDisruptive)
+    ,("routine skip logs coalesce while errors remain visible", DiagnosticsCoalesceOnlyRoutineEvents)
     ,("leading case-only editor normalization is safe", LeadingCaseOnlyEditorNormalization)
     ,("correction response retry is bounded", CorrectionResponseRetryIsBounded)
     ,("stale physical key state is reconciled", StalePhysicalKeyStateIsReconciled)
@@ -878,6 +892,105 @@ static void MutationCurrentnessIsRecheckedAfterKeyWait()
     Assert(!outcome.ShouldInvalidateTrackedText);
 }
 
+static void ManualRefreshFailuresAreBeforeMutation()
+{
+    foreach (var stage in new[]
+             {
+                 "refresh-focused-element-unavailable", "refresh-focused-editor-changed",
+                 "refresh-stale", "refresh-text-changed", "refresh-target-not-found", "refresh-exception"
+             })
+    {
+        var diagnostic = $"stage={stage} mutationAttempted=False";
+        var writes = 0;
+        var attempts = 0;
+        var outcome = SafeMutationRetry.RunAsync(1, 100, () => true,
+                () => ++attempts == 1
+                    ? new MutationAttempt<TextReplacementResult>(TextReplacementResult.EditorUnavailable, diagnostic)
+                    : new MutationAttempt<TextReplacementResult>(++writes == 1
+                        ? TextReplacementResult.Applied : TextReplacementResult.PasteFailed, "stage=verified-paste"),
+                result => result == TextReplacementResult.Applied,
+                (_, detail) => SendInputService.CanSafelyRetry("original", detail), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Assert(outcome.Succeeded);
+        Equal(2, attempts);
+        Equal(1, writes);
+        Assert(!outcome.ShouldInvalidateTrackedText);
+        var message = ManualCorrectionService.ReplacementFailureMessage(TextReplacementResult.EditorUnavailable,
+            diagnostic);
+        Assert(message.Contains("Nothing was changed", StringComparison.Ordinal));
+        Assert(!message.Contains("whether", StringComparison.Ordinal));
+
+        var exhausted = SafeMutationRetry.RunAsync(1, 100, () => true,
+                () => new MutationAttempt<TextReplacementResult>(TextReplacementResult.EditorUnavailable, diagnostic),
+                result => result == TextReplacementResult.Applied,
+                (_, detail) => SendInputService.CanSafelyRetry("original", detail), CancellationToken.None)
+            .GetAwaiter().GetResult();
+        Equal(MutationStopReason.AttemptsExhausted, exhausted.StopReason);
+        Assert(!exhausted.ShouldInvalidateTrackedText);
+    }
+}
+
+static void OriginalTextMismatchStopsRetry()
+{
+    var attempts = 0;
+    var diagnostic = "text=[stage=text-suffix-mismatch actualLength=10 targetLength=10] " +
+                     "fallback=[stage=value-suffix-mismatch valueLength=10 targetLength=10]";
+    Assert(SendInputService.ConfirmsOriginalTextChanged(diagnostic));
+    var outcome = SafeMutationRetry.RunAsync(3, 100, () => true,
+            () =>
+            {
+                attempts++;
+                return new MutationAttempt<bool>(false, diagnostic,
+                    SendInputService.ConfirmsOriginalTextChanged(diagnostic));
+            }, applied => applied, (_, _) => true, CancellationToken.None).GetAwaiter().GetResult();
+    Equal(1, attempts);
+    Equal(MutationStopReason.OriginalTextChanged, outcome.StopReason);
+    Assert(outcome.ShouldInvalidateTrackedText);
+    Assert(!SendInputService.ConfirmsOriginalTextChanged(
+        "stage=first-paste-selection-lost mutation-ambiguous"));
+    Assert(!SendInputService.ConfirmsOriginalTextChanged(
+        "text=[stage=selection timeout attempts=3] fallback=[stage=value-suffix-mismatch]"));
+    Assert(!SendInputService.ConfirmsOriginalTextChanged("stage=exception type=COMException"));
+}
+
+static void TypingResumesAfterEditorMismatch()
+{
+    var buffer = new TypingBuffer();
+    var window = new WindowIdentity(new IntPtr(1), 1, "brave.exe", "test editor");
+    long version = 0;
+    foreach (var character in "previous message")
+        buffer.Handle(new(++version, character, character, false, false, false, DateTimeOffset.UtcNow), window);
+    var previous = buffer.GetSnapshot();
+    buffer.Handle(new(++version, NativeMethods.VkReturn, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(!buffer.TryInvalidate(previous.BufferVersion));
+    Assert(buffer.GetSnapshot().BufferText.EndsWith('\n'));
+    Assert(buffer.TryInvalidate(version));
+    Assert(!buffer.GetSnapshot().IsSynchronized);
+    foreach (var character in "fresh misspeling")
+        buffer.Handle(new(++version, character, character, false, false, false, DateTimeOffset.UtcNow), window);
+    Equal("fresh misspeling", buffer.GetSnapshot().BufferText);
+    Assert(buffer.GetSnapshot().IsSynchronized);
+    var fresh = buffer.GetSnapshot();
+    buffer.Handle(new(++version, NativeMethods.VkBack, null, false, false, false, DateTimeOffset.UtcNow), window);
+    Assert(!buffer.TryInvalidate(fresh.BufferVersion));
+    Equal("fresh misspelin", buffer.GetSnapshot().BufferText);
+}
+
+static void EditorTypographyMatchingIsNarrow()
+{
+    Assert(SendInputService.IsEditorEquivalent("this isn't corect", "this isn\u2019t corect"));
+    Assert(SendInputService.IsEditorEquivalent("\"this needs corection\"", "\u201Cthis needs corection\u201D"));
+    Assert(SendInputService.IsEditorEquivalent("this isn't corect", "This isn\u2019t corect"));
+    Assert(!SendInputService.IsEditorEquivalent("this isn't corect", "this isn\u2019t correct"));
+    Assert(!SendInputService.IsEditorEquivalent("test 9600 isn't ready", "test 19200 isn\u2019t ready"));
+    Assert(!SendInputService.IsEditorEquivalent("test-a isn't ready", "test-b isn\u2019t ready"));
+    Assert(!SendInputService.IsEditorEquivalent("this is corect", "This is Corect"));
+    Assert(!SendInputService.IsEditorEquivalent("alpha beta", "alpha\u00A0beta"));
+    Assert(!SendInputService.IsEditorEquivalent("test-thing", "test\u2014thing"));
+    Assert(!SendInputService.IsEditorEquivalent("(test)", "[test]"));
+    Assert(!SendInputService.IsEditorEquivalent("test\n", "test"));
+}
+
 static void UnanchoredInsertionRetryPolicy()
 {
     Assert(SendInputService.CanSafelyRetry(string.Empty, "stage=selection timeout attempts=3"));
@@ -911,6 +1024,13 @@ static void TextMismatchDiagnosticsAreMetadataOnly()
     Assert(diagnostic.Contains("actualKind=nonbreaking-space", StringComparison.Ordinal));
     Assert(!diagnostic.Contains("alpha", StringComparison.Ordinal));
     Assert(!diagnostic.Contains("beta", StringComparison.Ordinal));
+    var punctuation = SendInputService.DescribeMismatch("'alpha'", "\u2018alpha\u2019");
+    Assert(punctuation.Contains("expectedPunctuation=U+0027", StringComparison.Ordinal));
+    Assert(punctuation.Contains("actualPunctuation=U+2018", StringComparison.Ordinal));
+    Assert(!punctuation.Contains("alpha", StringComparison.Ordinal));
+    var letters = SendInputService.DescribeMismatch("alpha", "blpha");
+    Assert(!letters.Contains("U+0061", StringComparison.Ordinal));
+    Assert(!letters.Contains("U+0062", StringComparison.Ordinal));
 }
 
 static void LeadingCaseOnlyEditorNormalization()
@@ -920,6 +1040,117 @@ static void LeadingCaseOnlyEditorNormalization()
     Assert(!SendInputService.IsLeadingCaseOnlyDifference("this is a test", "Xhis is a test"));
     Assert(!SendInputService.IsLeadingCaseOnlyDifference("this is a test", "This is a Test"));
     Assert(!SendInputService.IsLeadingCaseOnlyDifference("1 test", "2 test"));
+}
+
+static void DiagnosticScopesStayIsolated()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"spellchecker-diagnostic-scope-{Guid.NewGuid():N}");
+    try
+    {
+        var logger = new DiagnosticsLogger(directory);
+        async Task RunOperation(string process, long version)
+        {
+            using var operation = logger.BeginOperation("test", process, version);
+            logger.MarkProviderRequest();
+            await logger.WriteAsync("TestRequestStarted");
+            await Task.Yield();
+            logger.SetOperationStage("mutation");
+            Assert(logger.OperationContactedProvider);
+            await logger.WriteAsync("TestRequestFinished");
+        }
+        Task.WhenAll(RunOperation("first.exe", 12), RunOperation("second.exe", 18)).GetAwaiter().GetResult();
+        Assert(!logger.OperationContactedProvider);
+        logger.WriteAsync("OutsideOperation").GetAwaiter().GetResult();
+        var lines = File.ReadAllLines(logger.LogPath);
+        Equal(5, lines.Length);
+        var ids = new List<string>();
+        foreach (var process in new[] { "first.exe", "second.exe" })
+        {
+            var operationLines = lines.Where(line => line.Contains("OperationProcess=" + process, StringComparison.Ordinal)).ToArray();
+            Equal(2, operationLines.Length);
+            var operationIds = operationLines.Select(line => System.Text.RegularExpressions.Regex.Match(line,
+                @"\bOperationId=(\d+)").Groups[1].Value).Distinct().ToArray();
+            Equal(1, operationIds.Length);
+            ids.Add(operationIds[0]);
+            Assert(operationLines[0].Contains("Stage=provider", StringComparison.Ordinal));
+            Assert(operationLines[1].Contains("Stage=mutation", StringComparison.Ordinal));
+        }
+        Equal(2, ids.Distinct().Count());
+        Assert(lines.All(line => line.Contains("SessionId=", StringComparison.Ordinal) && line.Contains("BuildId=", StringComparison.Ordinal)));
+        Assert(!lines[^1].Contains("OperationId=", StringComparison.Ordinal));
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void DiagnosticsProtectSensitiveContent()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"spellchecker-diagnostic-privacy-{Guid.NewGuid():N}");
+    const string privateText = "private-sentence-and-fake-api-key-sentinel";
+    try
+    {
+        var logger = new DiagnosticsLogger(directory);
+        logger.WriteAsync("SensitiveFields", new Dictionary<string, object?>
+        {
+            ["api_key"] = privateText, ["Prompt"] = privateText, ["Message"] = privateText,
+            ["Authorization"] = privateText, ["OriginalText"] = privateText,
+            ["BearerToken"] = privateText, ["TargetLength"] = 27
+        }).GetAwaiter().GetResult();
+        var failure = new ProviderUnavailableException(privateText, 429, privateText, true, privateText);
+        logger.WriteAsync("ProviderFailed", DiagnosticMetadata.Failure(failure)).GetAwaiter().GetResult();
+        var settings = new AppSettings { CustomCorrectionInstructions = privateText };
+        settings.OllamaProvider.Endpoint = "http://example.test:11434/?key=" + privateText;
+        logger.WriteAsync("SettingsSnapshot", DiagnosticMetadata.Settings(settings)).GetAwaiter().GetResult();
+        var log = File.ReadAllText(logger.LogPath);
+        Assert(!log.Contains(privateText, StringComparison.Ordinal));
+        Assert(!log.Contains("example.test", StringComparison.Ordinal));
+        Assert(log.Contains("api_key=redacted", StringComparison.Ordinal));
+        Assert(log.Contains("HttpStatus=429", StringComparison.Ordinal));
+        Assert(log.Contains("ProviderStatus=OTHER", StringComparison.Ordinal));
+        Assert(log.Contains("CustomInstructionConfigured=True", StringComparison.Ordinal));
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void DiagnosticsFailureIsNonDisruptive()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"spellchecker-diagnostic-failure-{Guid.NewGuid():N}");
+    try
+    {
+        var logger = new DiagnosticsLogger(directory);
+        // Block only this unique test log path; no application files are involved.
+        Directory.CreateDirectory(logger.LogPath);
+        var edits = 0;
+        edits++;
+        logger.WriteAsync("CorrectionCompleted").GetAwaiter().GetResult();
+        Equal(1, edits);
+        Equal(1, logger.FailedWrites);
+        Directory.Move(logger.LogPath, Path.Combine(directory, "blocked-log-path"));
+        logger.WriteAsync("LoggingResumed").GetAwaiter().GetResult();
+        Equal(0, logger.FailedWrites);
+        Assert(File.ReadAllText(logger.LogPath).Contains("DroppedLogWrites=1", StringComparison.Ordinal));
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static void DiagnosticsCoalesceOnlyRoutineEvents()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"spellchecker-diagnostic-rate-{Guid.NewGuid():N}");
+    try
+    {
+        var logger = new DiagnosticsLogger(directory);
+        var fields = new Dictionary<string, object?> { ["Reason"] = "unsynchronized" };
+        logger.WriteRateLimitedAsync("CorrectionSkipped", "routine", fields).GetAwaiter().GetResult();
+        logger.WriteRateLimitedAsync("CorrectionSkipped", "routine", fields).GetAwaiter().GetResult();
+        logger.WriteRateLimitedAsync("CorrectionSkipped", "routine", fields).GetAwaiter().GetResult();
+        logger.WriteAsync("CorrectionFailed", new Dictionary<string, object?> { ["Reason"] = "test-failure" })
+            .GetAwaiter().GetResult();
+        logger.WriteRateLimitedAsync("CorrectionSkipped", "routine", fields, TimeSpan.Zero).GetAwaiter().GetResult();
+        var lines = File.ReadAllLines(logger.LogPath);
+        Equal(3, lines.Length);
+        Assert(lines[1].Contains("Event=CorrectionFailed", StringComparison.Ordinal));
+        Assert(lines[2].Contains("SuppressedEvents=2", StringComparison.Ordinal));
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
 }
 
 static void CorrectionResponseRetryIsBounded()
@@ -1180,20 +1411,30 @@ static int RunEditorMessageSmoke()
     static string NormalizeNewlines(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal);
 }
 
-static int RunRecoverySmoke()
+static int RunRecoverySmoke(bool waitForStart)
 {
     Forms.Form? form = null;
     Forms.TextBox? textBox = null;
     Exception? failure = null;
     long[] mutationSamples = [];
     using var ready = new ManualResetEventSlim();
+    using var start = new ManualResetEventSlim(!waitForStart);
     var uiThread = new Thread(() =>
     {
         try
         {
-            form = new Forms.Form { ShowInTaskbar = false, Width = 360, Height = 120 };
+            form = new Forms.Form
+            {
+                Text = "Spellchecker recovery test", ShowInTaskbar = waitForStart, Width = 360, Height = 140
+            };
             textBox = new Forms.TextBox { Dock = Forms.DockStyle.Fill };
             form.Controls.Add(textBox);
+            if (waitForStart)
+            {
+                var startButton = new Forms.Button { Text = "Start recovery checks", Dock = Forms.DockStyle.Bottom };
+                startButton.Click += (_, _) => { startButton.Enabled = false; textBox.Focus(); start.Set(); };
+                form.Controls.Add(startButton);
+            }
             form.Shown += (_, _) => ready.Set();
             Forms.Application.Run(form);
         }
@@ -1203,6 +1444,12 @@ static int RunRecoverySmoke()
     uiThread.Start();
     if (!ready.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Recovery test editor did not start.");
     if (failure is not null) throw failure;
+
+    if (waitForStart)
+    {
+        Console.WriteLine("RECOVERY_READY: activate the test window and click Start recovery checks.");
+        if (!start.Wait(TimeSpan.FromSeconds(120))) throw new TimeoutException("Recovery test was not started.");
+    }
 
     var automationThread = new Thread(() =>
     {
@@ -1280,10 +1527,11 @@ static int RunRecoverySmoke()
     return 0;
 }
 
-static int RunUiaReplacementSmoke()
+static int RunUiaReplacementSmoke(bool waitForStart)
 {
     Exception? failure = null;
     using var ready = new ManualResetEventSlim();
+    using var start = new ManualResetEventSlim(!waitForStart);
     Forms.Form? form = null;
     Forms.TextBox? valueBox = null;
     Forms.RichTextBox? richBox = null;
@@ -1291,11 +1539,21 @@ static int RunUiaReplacementSmoke()
     {
         try
         {
-            form = new Forms.Form { ShowInTaskbar = false, Left = 100, Top = 100, Width = 300, Height = 180 };
+            form = new Forms.Form
+            {
+                Text = "Spellchecker UI Automation test", ShowInTaskbar = waitForStart,
+                Left = 100, Top = 100, Width = 400, Height = 240
+            };
             valueBox = new Forms.TextBox { Text = "this is s test", Dock = Forms.DockStyle.Top };
             richBox = new Forms.RichTextBox { Text = "i just hit enter" + Environment.NewLine, Dock = Forms.DockStyle.Fill };
             form.Controls.Add(richBox);
             form.Controls.Add(valueBox);
+            if (waitForStart)
+            {
+                var startButton = new Forms.Button { Text = "Start focus safety checks", Dock = Forms.DockStyle.Bottom };
+                startButton.Click += (_, _) => { startButton.Enabled = false; start.Set(); };
+                form.Controls.Add(startButton);
+            }
             form.Shown += (_, _) => ready.Set();
             Forms.Application.Run(form);
         }
@@ -1305,6 +1563,11 @@ static int RunUiaReplacementSmoke()
     uiThread.Start();
     if (!ready.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("UI Automation test controls did not start.");
     if (failure is not null) throw failure;
+    if (waitForStart)
+    {
+        Console.WriteLine("UIA_REPLACEMENT_READY: activate the test window and click Start focus safety checks.");
+        if (!start.Wait(TimeSpan.FromSeconds(120))) throw new TimeoutException("UI Automation test was not started.");
+    }
 
     var automationThread = new Thread(() =>
     {
@@ -1319,12 +1582,42 @@ static int RunUiaReplacementSmoke()
             var valueHandle = (IntPtr)form.Invoke(new Func<IntPtr>(() => valueBox.Handle));
             var richHandle = (IntPtr)form.Invoke(new Func<IntPtr>(() => richBox.Handle));
             var valueElement = System.Windows.Automation.AutomationElement.FromHandle(valueHandle);
+            var initialCaret = (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart));
+            Equal(EditorTextMatch.Match,
+                SendInputService.CheckPreviousTextForElement(valueElement, "this is s test", out _));
+            Equal(EditorTextMatch.Mismatch,
+                SendInputService.CheckPreviousTextForElement(valueElement, "this is s text", out _));
+            Equal("this is s test", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal(initialCaret, (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+            Equal(0, (int)form.Invoke(new Func<int>(() => valueBox.SelectionLength)));
+            form.Invoke(() => { valueBox.SelectionStart = 0; valueBox.SelectionLength = 4; });
+            Equal(EditorTextMatch.Unavailable,
+                SendInputService.CheckPreviousTextForElement(valueElement, "this is s test", out _));
+            Equal(4, (int)form.Invoke(new Func<int>(() => valueBox.SelectionLength)));
+            form.Invoke(() => { valueBox.SelectionStart = valueBox.TextLength; valueBox.SelectionLength = 0; });
             if (!SendInputService.ReplaceForElement(valueElement, "this is s test", "This is a test."))
                 throw new InvalidOperationException($"ValuePattern replacement failed; patterns={PatternNames(valueElement)}");
             var actualValue = (string)form.Invoke(new Func<string>(() => valueBox.Text));
             Equal("This is a test.", actualValue);
             var valueCaret = (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart));
             Equal(actualValue.Length, valueCaret);
+
+            form.Invoke(() =>
+            {
+                valueBox.Text = "unchanged prefix | this isn\u2019t corect  ";
+                valueBox.SelectionStart = valueBox.TextLength;
+                valueBox.SelectionLength = 0;
+            });
+            Equal(EditorTextMatch.Match,
+                SendInputService.CheckPreviousTextForElement(valueElement, "this isn't corect  ", out _));
+            Assert(SendInputService.ReplaceForElement(valueElement, "this isn't corect  ", "this isn't correct  "));
+            Equal("unchanged prefix | this isn't correct  ", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+            Equal("unchanged prefix | this isn't correct  ".Length,
+                (int)form.Invoke(new Func<int>(() => valueBox.SelectionStart)));
+            form.Invoke(() => valueBox.Text = string.Empty); // Enter submitted/cleared the field
+            Equal(EditorTextMatch.Mismatch,
+                SendInputService.CheckPreviousTextForElement(valueElement, "this isn't correct  \n", out _));
+            Equal(string.Empty, (string)form.Invoke(new Func<string>(() => valueBox.Text)));
 
             form.Invoke(() =>
             {
@@ -1497,9 +1790,48 @@ static int RunUiaReplacementSmoke()
             Thread.Sleep(50);
             Assert(!ManualCorrectionService.TryRefreshTarget(selectedTarget, out _,
                 out var changedEditorDiagnostic));
-            Equal("stage=refresh-focused-editor-changed", changedEditorDiagnostic);
+            Assert(changedEditorDiagnostic.StartsWith("stage=refresh-focused-editor-changed", StringComparison.Ordinal));
+            Assert(changedEditorDiagnostic.Contains("mutationAttempted=False", StringComparison.Ordinal));
+            Assert(SendInputService.CanSafelyRetry(selectedTarget.OriginalText, changedEditorDiagnostic));
             Equal("this has adress here", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
             Equal("adress", (string)form.Invoke(new Func<string>(() => richBox.Text)));
+
+            if (waitForStart)
+            {
+                var rootWindow = new WindowIdentity((IntPtr)form.Invoke(new Func<IntPtr>(() => form.Handle)),
+                    Environment.ProcessId, "test.exe", "focus test");
+                var focusTarget = selectedTarget with { Window = rootWindow };
+                var focusClock = new InputVersionClock();
+                var expectedVersion = focusClock.Current;
+                focusClock.Increment(); // resumed typing/Enter/Backspace must forbid refocusing
+                Assert(!ManualCorrectionService.TryRefreshTarget(focusTarget, out _, out var staleFocusDiagnostic,
+                    () => focusClock.Current == expectedVersion));
+                Assert(staleFocusDiagnostic.Contains("refresh-stale", StringComparison.Ordinal));
+                Assert(!ManualCorrectionService.TargetEditorIsFocused(focusTarget));
+
+                Assert(ManualCorrectionService.TryRefreshTarget(focusTarget, out var restoredTarget,
+                    out var restoredFocusDiagnostic, () => true));
+                Assert(restoredFocusDiagnostic.Contains("focusRestored=True", StringComparison.Ordinal));
+                Assert(ManualCorrectionService.TargetEditorIsFocused(restoredTarget));
+                Equal("this has adress here", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+                Equal("adress", (string)form.Invoke(new Func<string>(() => richBox.Text)));
+
+                // Reject an identical word in another field after the original
+                // captured range was edited, rather than searching for a new target.
+                form.Invoke(() => { valueBox.Text = "different text"; richBox.Focus(); });
+                Assert(!ManualCorrectionService.TryRefreshTarget(focusTarget, out _, out _, () => true));
+                Assert(!ManualCorrectionService.TargetEditorIsFocused(focusTarget));
+                Equal("different text", (string)form.Invoke(new Func<string>(() => valueBox.Text)));
+                Equal("adress", (string)form.Invoke(new Func<string>(() => richBox.Text)));
+                form.Invoke(() =>
+                {
+                    valueBox.Text = "this has adress here";
+                    valueBox.SelectionStart = 9;
+                    valueBox.SelectionLength = 6;
+                    valueBox.Focus();
+                });
+                Assert(ManualCorrectionService.TryCaptureFromElement(valueElement, testWindow, null, out selectedTarget));
+            }
 
             // Simulate the non-activating offer click collapsing the editor's
             // visible selection while the captured range remains valid.

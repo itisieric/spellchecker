@@ -93,6 +93,18 @@ public sealed class TypingBuffer
         lock (_gate) return SnapshotUnsafe();
     }
 
+    public bool TryInvalidate(long expectedVersion)
+    {
+        lock (_gate)
+        {
+            // A read-only editor check may discover that Enter submitted a field
+            // or the editor reformatted it. Never clear newer typing while doing so.
+            if (_version != expectedVersion) return false;
+            ResetUnsafe(_window);
+            return true;
+        }
+    }
+
     public bool TryReplaceSuffix(long expectedVersion, string original, string replacement, long resultingVersion)
     {
         lock (_gate)

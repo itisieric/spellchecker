@@ -29,6 +29,7 @@ public partial class SettingsWindow : Window
         StartupManager startup, IProviderSecretStore secretStore, IProviderConnectionTester providerTester)
     {
         InitializeComponent();
+        Icon = ApplicationIcon.CreateWindowIcon();
         _settings = settings; _dictionary = dictionary; _memory = memory; _spellingHistory = spellingHistory;
         _commandHistory = commandHistory;
         _logger = logger; _startup = startup; _secretStore = secretStore; _providerTester = providerTester;
@@ -139,6 +140,7 @@ public partial class SettingsWindow : Window
         if (int.TryParse(LatencyText.Text, out var latency)) s.ArtificialLatencyMs = Math.Clamp(latency, 0, 5000);
         s.ExcludedProcesses = ExcludedText.Text.Split([',', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         await _settings.SaveAsync();
+        await _logger.WriteAsync("SettingsSaved", DiagnosticMetadata.Settings(s));
         _startup.SetEnabled(s.StartWithWindows);
         _pendingSecrets.Clear();
         CredentialPassword.Clear();

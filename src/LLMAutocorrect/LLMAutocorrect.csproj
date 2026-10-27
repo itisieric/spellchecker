@@ -6,10 +6,17 @@
     <UseWindowsForms>true</UseWindowsForms>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AssemblyName>LLMAutocorrect</AssemblyName>
+    <AssemblyTitle>LLM Autocorrect</AssemblyTitle>
+    <Product>LLM Autocorrect</Product>
     <RootNamespace>LLMAutocorrect</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\Spellchecker.ico</ApplicationIcon>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\Spellchecker.ico" />
+    <Content Include="Assets\Spellchecker.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="Spellchecker.ico" />
+  </ItemGroup>
 </Project>

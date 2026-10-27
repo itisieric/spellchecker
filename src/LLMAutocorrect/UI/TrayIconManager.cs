@@ -8,6 +8,7 @@ namespace LLMAutocorrect.UI;
 public sealed class TrayIconManager : IDisposable
 {
     private readonly Forms.NotifyIcon _icon;
+    private readonly Drawing.Icon _applicationIcon;
     private readonly SettingsManager _settings;
     private readonly Func<SettingsWindow> _settingsWindow;
     private readonly Action _undo;
@@ -21,7 +22,8 @@ public sealed class TrayIconManager : IDisposable
         _settings = settings; _settingsWindow = settingsWindow; _undo = undo;
         _releaseLocalResources = releaseLocalResources;
         _canReleaseLocalResources = canReleaseLocalResources;
-        _icon = new Forms.NotifyIcon { Icon = Drawing.SystemIcons.Information, Text = "LLM Autocorrect", Visible = true };
+        _applicationIcon = ApplicationIcon.CreateTrayIcon(Forms.SystemInformation.SmallIconSize);
+        _icon = new Forms.NotifyIcon { Icon = _applicationIcon, Text = "LLM Autocorrect", Visible = true };
         var menu = new Forms.ContextMenuStrip();
         var enabled = new Forms.ToolStripMenuItem("Enabled") { Checked = settings.Current.Enabled, CheckOnClick = true };
         enabled.CheckedChanged += async (_, _) => { settings.Current.Enabled = enabled.Checked; await settings.SaveAsync(); };
@@ -98,5 +100,5 @@ public sealed class TrayIconManager : IDisposable
         window.Show(); window.Activate();
     }
 
-    public void Dispose() { _icon.Visible = false; _icon.Dispose(); }
+    public void Dispose() { _icon.Visible = false; _icon.Dispose(); _applicationIcon.Dispose(); }
 }

@@ -81,7 +81,7 @@ public sealed class InputRuntime : IAsyncDisposable
         {
             await TryLogAsync("InputWorkerTerminated", new Dictionary<string, object?>
             {
-                ["Type"] = ex.GetType().Name, ["HResult"] = ex.HResult, ["Message"] = ex.Message
+                ["Type"] = ex.GetType().Name, ["HResult"] = ex.HResult
             });
         }
     }
@@ -114,7 +114,6 @@ public sealed class InputRuntime : IAsyncDisposable
             ["EventType"] = message.GetType().Name,
             ["Type"] = ex.GetType().Name,
             ["HResult"] = ex.HResult,
-            ["Message"] = ex.Message,
             ["Recovered"] = true
         });
     }

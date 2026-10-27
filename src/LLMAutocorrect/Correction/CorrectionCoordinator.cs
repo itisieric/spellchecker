@@ -69,6 +69,7 @@ public sealed class CorrectionCoordinator : IDisposable
 
     private async Task RunScheduledAsync(TypingSnapshot snapshot, bool immediate, CancellationToken cancellationToken)
     {
+        using var logOperation = _logger.BeginOperation("autocorrect", snapshot.Window.ProcessName, snapshot.BufferVersion);
         var processed = false;
         try
         {
@@ -76,7 +77,16 @@ public sealed class CorrectionCoordinator : IDisposable
             processed = true;
             await ProcessAsync(snapshot, cancellationToken, false);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            if (_logger.OperationContactedProvider)
+                await _logger.WriteAsync("CorrectionCancelled", new Dictionary<string, object?>
+                {
+                    ["CurrentInputVersion"] = _clock.Current,
+                    ["InputChanged"] = _clock.Current != snapshot.BufferVersion,
+                    ["WindowMatches"] = _foreground.Matches(snapshot.Window.WindowHandle, snapshot.Window.ProcessId)
+                });
+        }
         catch (Exception ex)
         {
             await LogProviderFailureAsync("CorrectionFailed", ex);
@@ -92,7 +102,16 @@ public sealed class CorrectionCoordinator : IDisposable
                     if (_clock.Current == snapshot.BufferVersion)
                         await ProcessAsync(snapshot, cancellationToken, true);
                 }
-                catch (OperationCanceledException) { }
+                catch (OperationCanceledException)
+                {
+                    if (_logger.OperationContactedProvider)
+                        await _logger.WriteAsync("CorrectionCancelled", new Dictionary<string, object?>
+                        {
+                            ["CurrentInputVersion"] = _clock.Current,
+                            ["InputChanged"] = _clock.Current != snapshot.BufferVersion,
+                            ["WindowMatches"] = _foreground.Matches(snapshot.Window.WindowHandle, snapshot.Window.ProcessId)
+                        });
+                }
                 catch (Exception retryEx)
                 {
                     await LogProviderFailureAsync("CorrectionRetryFailed", retryEx);
@@ -108,6 +127,7 @@ public sealed class CorrectionCoordinator : IDisposable
 
     private async Task ProcessAsync(TypingSnapshot snapshot, CancellationToken cancellationToken, bool isRetry)
     {
+        _logger.SetOperationStage("preflight");
         var processStarted = DateTimeOffset.UtcNow;
         var pipeline = Stopwatch.StartNew();
         var settings = _settings.Current;
@@ -130,6 +150,33 @@ public sealed class CorrectionCoordinator : IDisposable
         var suffixToReplace = extracted.Target + extracted.Trailing;
         var requestSnapshot = new CorrectionSnapshot(snapshot.BufferVersion, snapshot.Window.WindowHandle,
             snapshot.Window.ProcessId, focus.RuntimeId, suffixToReplace, DateTimeOffset.UtcNow);
+        // Read without selecting, focusing, changing the clipboard, or writing.
+        // Give a lagging accessibility provider one short opportunity to settle.
+        if (_input.CheckPreviousText(suffixToReplace, out _) == EditorTextMatch.Mismatch)
+        {
+            await Task.Delay(75, cancellationToken);
+            if (!StillCurrent(requestSnapshot))
+            {
+                await LogSkipAsync(snapshot, "stale-during-editor-check");
+                return;
+            }
+            if (_input.CheckPreviousText(suffixToReplace, out var editorDiagnostic) == EditorTextMatch.Mismatch)
+            {
+                var invalidated = _buffer.TryInvalidate(snapshot.BufferVersion);
+                await _logger.WriteAsync("CorrectionSkipped", new Dictionary<string, object?>
+                {
+                    ["Process"] = snapshot.Window.ProcessName,
+                    ["EditorClass"] = focus.ClassName,
+                    ["TargetLength"] = extracted.Target.Length,
+                    ["Reason"] = "editor-text-mismatch",
+                    ["ProviderRequested"] = false,
+                    ["BufferInvalidated"] = invalidated,
+                    ["Diagnostic"] = editorDiagnostic,
+                    ["PreflightMs"] = pipeline.ElapsedMilliseconds
+                });
+                return;
+            }
+        }
         var protectedTokens = _tokenDetector.Detect(extracted.Target, _dictionary.Terms);
         var addressBarStyle = settings.BrowserAddressBarSpellingOnly && focus.IsBrowserAddressBar(snapshot.Window.ProcessName);
         var request = new CorrectionRequest(extracted.Context, extracted.Target, _dictionary.Terms, protectedTokens,
@@ -137,6 +184,7 @@ public sealed class CorrectionCoordinator : IDisposable
         var preflightMs = pipeline.ElapsedMilliseconds;
 
         var interval = TimeSpan.FromMilliseconds(settings.MinimumRequestIntervalMs) - (DateTimeOffset.UtcNow - _lastRequest);
+        _logger.SetOperationStage("throttle");
         var throttle = Stopwatch.StartNew();
         if (interval > TimeSpan.Zero) await Task.Delay(interval, cancellationToken);
         throttle.Stop();
@@ -150,10 +198,15 @@ public sealed class CorrectionCoordinator : IDisposable
         string? initialValidation = null;
         try
         {
-            var provider = Stopwatch.StartNew();
+            var provider = new Stopwatch();
+            _logger.MarkProviderRequest();
+            await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+                { ["Provider"] = settings.Provider.ToString(), ["TargetLength"] = extracted.Target.Length, ["Retry"] = isRetry });
+            provider.Start();
             result = await _provider.CorrectAsync(request, cancellationToken);
             provider.Stop();
             providerMs += provider.ElapsedMilliseconds;
+            _logger.SetOperationStage("validation");
             if (result.ShouldReplace)
             {
                 var validationTimer = Stopwatch.StartNew();
@@ -165,10 +218,14 @@ public sealed class CorrectionCoordinator : IDisposable
                     initialValidation = validation.Reason;
                     responseRetryAttempted = true;
                     request = CorrectionResponseRetry.CreateStrictRequest(request);
+                    _logger.MarkProviderRequest();
+                    await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+                        { ["Provider"] = settings.Provider.ToString(), ["TargetLength"] = extracted.Target.Length, ["Retry"] = true });
                     provider.Restart();
                     result = await _provider.CorrectAsync(request, cancellationToken);
                     provider.Stop();
                     providerMs += provider.ElapsedMilliseconds;
+                    _logger.SetOperationStage("validation");
                     validationTimer.Restart();
                     validation = _validator.Validate(request, result, settings.MaximumEditRatio);
                     validationTimer.Stop();
@@ -182,6 +239,7 @@ public sealed class CorrectionCoordinator : IDisposable
         {
             if (!isRetry && !responseRetryAttempted)
             {
+                _logger.SetOperationStage("uncertain-retry-delay");
                 await Task.Delay(settings.CorrectionRetryDelayMs, cancellationToken);
                 if (StillCurrent(requestSnapshot)) await ProcessAsync(snapshot, cancellationToken, true);
             }
@@ -190,7 +248,7 @@ public sealed class CorrectionCoordinator : IDisposable
                 await _logger.WriteAsync("CorrectionUncertain", new Dictionary<string, object?>
                 {
                     ["Process"] = snapshot.Window.ProcessName, ["TargetLength"] = extracted.Target.Length,
-                    ["Reason"] = string.IsNullOrWhiteSpace(result.Reason) ? "unclear" : result.Reason
+                    ["Reason"] = "unclear", ["ReasonProvided"] = !string.IsNullOrWhiteSpace(result.Reason)
                 });
                 ShowStatus(snapshot.Window.WindowHandle, "Not corrected: " + CleanReason(result.Reason));
             }
@@ -207,6 +265,7 @@ public sealed class CorrectionCoordinator : IDisposable
         var metadata = new Dictionary<string, object?>
         {
             ["Process"] = snapshot.Window.ProcessName, ["TargetLength"] = extracted.Target.Length,
+            ["EditorClass"] = focus.ClassName, ["EditorEditable"] = focus.IsEditable,
             ["LatencyMs"] = providerMs, ["ProviderMs"] = providerMs,
             ["ScheduleDelayMs"] = Math.Max(0, (long)(processStarted - snapshot.Created).TotalMilliseconds),
             ["PreflightMs"] = preflightMs, ["ThrottleWaitMs"] = throttle.ElapsedMilliseconds,
@@ -228,6 +287,7 @@ public sealed class CorrectionCoordinator : IDisposable
         // one final quiet window before touching the editor; any new key cancels this
         // scheduled correction and the newer snapshot gets its own request.
         var commitGuard = Stopwatch.StartNew();
+        _logger.SetOperationStage("commit-guard");
         await Task.Delay(settings.CorrectionCommitDelayMs, cancellationToken);
         commitGuard.Stop();
         metadata["CommitGuardMs"] = commitGuard.ElapsedMilliseconds;
@@ -239,6 +299,7 @@ public sealed class CorrectionCoordinator : IDisposable
             return;
         }
         var keyRelease = Stopwatch.StartNew();
+        _logger.SetOperationStage("key-release");
         if (!_input.WaitForPhysicalKeysReleased())
         {
             keyRelease.Stop();
@@ -260,6 +321,7 @@ public sealed class CorrectionCoordinator : IDisposable
         }
 
         var replacement = result.Replacement.TrimEnd() + extracted.Trailing;
+        _logger.SetOperationStage("mutation");
         var mutationTimer = Stopwatch.StartNew();
         var mutation = await SafeMutationRetry.RunAsync(
             settings.InsertionRetryAttempts,
@@ -270,7 +332,8 @@ public sealed class CorrectionCoordinator : IDisposable
             {
                 var applied = _input.ReplacePreviousText(requestSnapshot.OriginalTargetText, replacement,
                     () => StillCurrent(requestSnapshot));
-                return new MutationAttempt<bool>(applied, _input.LastFailureDiagnostic);
+                return new MutationAttempt<bool>(applied, _input.LastFailureDiagnostic,
+                    !applied && SendInputService.ConfirmsOriginalTextChanged(_input.LastFailureDiagnostic));
             },
             applied => applied,
             (_, diagnostic) => SendInputService.CanSafelyRetry(requestSnapshot.OriginalTargetText, diagnostic),
@@ -282,10 +345,23 @@ public sealed class CorrectionCoordinator : IDisposable
             metadata["MutationDiagnostics"] = string.Join(" || ", mutation.Diagnostics);
         if (!mutation.Succeeded)
         {
+            var failureFocus = _focusedControl.GetCurrent();
+            metadata["CurrentEditorClass"] = failureFocus.ClassName;
+            metadata["FocusMatches"] = requestSnapshot.FocusedElementId is null || failureFocus.RuntimeId is null
+                ? null : requestSnapshot.FocusedElementId == failureFocus.RuntimeId;
             var automaticallyRecovered = mutation.Diagnostics.Any(SendInputService.RecoverySucceeded);
             metadata["MutationStopReason"] = mutation.StopReason.ToString();
+            metadata["CurrentInputVersion"] = _clock.Current;
+            metadata["InputChanged"] = _clock.Current != requestSnapshot.BufferVersion;
+            metadata["WindowMatches"] = _foreground.Matches(requestSnapshot.WindowHandle, requestSnapshot.ProcessId);
             metadata["AutomaticRecovery"] = automaticallyRecovered;
-            if (mutation.ShouldInvalidateTrackedText)
+            var originalTextChanged = mutation.StopReason == MutationStopReason.OriginalTextChanged;
+            if (originalTextChanged)
+            {
+                metadata["BufferInvalidated"] = _buffer.TryInvalidate(snapshot.BufferVersion);
+                metadata["Reason"] = "editor-text-mismatch";
+            }
+            else if (mutation.ShouldInvalidateTrackedText)
             {
                 var invalidatedVersion = _clock.Increment();
                 _buffer.Invalidate(_foreground.GetCurrent(), invalidatedVersion);
@@ -295,10 +371,11 @@ public sealed class CorrectionCoordinator : IDisposable
             {
                 MutationStopReason.CurrentnessLost => "insertion-currentness-lost",
                 MutationStopReason.AmbiguousMutation => "insertion-ambiguous",
+                MutationStopReason.OriginalTextChanged => "editor-text-mismatch",
                 _ => "send-input-failed"
             };
             AddFinalTimings(metadata, pipeline, snapshot);
-            await _logger.WriteAsync("CorrectionFailed", metadata);
+            await _logger.WriteAsync(originalTextChanged ? "CorrectionSkipped" : "CorrectionFailed", metadata);
             ShowStatus(snapshot.Window.WindowHandle,
                 automaticallyRecovered
                     ? "The correction failed, but Spellchecker automatically restored your original text."
@@ -308,9 +385,11 @@ public sealed class CorrectionCoordinator : IDisposable
                         "Correction cancelled because new input, focus, or editor state changed.",
                     MutationStopReason.AmbiguousMutation =>
                         "The editor could not confirm whether the correction was inserted. Spellchecker stopped to avoid duplicating text.",
+                    MutationStopReason.OriginalTextChanged =>
+                        "The original text no longer matched the editor. No correction was inserted.",
                     _ => "The correction could not be inserted after safe retries."
                 },
-                true);
+                !originalTextChanged);
             return;
         }
 
@@ -349,7 +428,7 @@ public sealed class CorrectionCoordinator : IDisposable
     {
         if (_clock.Current != snapshot.BufferVersion || !_foreground.Matches(snapshot.WindowHandle, snapshot.ProcessId)) return false;
         var currentBuffer = _buffer.GetSnapshot();
-        if (currentBuffer.BufferVersion != snapshot.BufferVersion ||
+        if (!currentBuffer.IsSynchronized || currentBuffer.BufferVersion != snapshot.BufferVersion ||
             !currentBuffer.BufferText.EndsWith(snapshot.OriginalTargetText, StringComparison.Ordinal)) return false;
         var focus = _focusedControl.GetCurrent();
         return !focus.IsPassword && (snapshot.FocusedElementId is null || focus.RuntimeId is null || snapshot.FocusedElementId == focus.RuntimeId);
@@ -407,25 +486,22 @@ public sealed class CorrectionCoordinator : IDisposable
         ? "the intended spelling was unclear."
         : reason.Trim().TrimEnd('.') + ".";
 
-    private Task LogSkipAsync(TypingSnapshot snapshot, string reason) => _logger.WriteAsync("CorrectionSkipped",
-        new Dictionary<string, object?>
+    private Task LogSkipAsync(TypingSnapshot snapshot, string reason)
+    {
+        var metadata = new Dictionary<string, object?>
         {
             ["Process"] = snapshot.Window.ProcessName,
             ["TargetLength"] = snapshot.BufferText.Length,
             ["Reason"] = reason
-        });
+        };
+        return reason == "unsynchronized"
+            ? _logger.WriteRateLimitedAsync("CorrectionSkipped", "correction-unsynchronized:" + snapshot.Window.ProcessName, metadata)
+            : _logger.WriteAsync("CorrectionSkipped", metadata);
+    }
 
     private Task LogProviderFailureAsync(string eventName, Exception exception)
     {
-        var metadata = new Dictionary<string, object?> { ["Type"] = exception.GetType().Name };
-        if (exception is ProviderUnavailableException provider)
-        {
-            metadata["HttpStatus"] = provider.StatusCode;
-            metadata["ProviderStatus"] = provider.ProviderStatus;
-            metadata["Retryable"] = provider.IsRetryable;
-            metadata["Reason"] = provider.Message;
-        }
-        return _logger.WriteAsync(eventName, metadata);
+        return _logger.WriteAsync(eventName, DiagnosticMetadata.Failure(exception));
     }
 
     public void Dispose()

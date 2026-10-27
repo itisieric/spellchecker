@@ -17,6 +17,8 @@ internal enum TextReplacementResult
     EditorUnavailable
 }
 
+internal enum EditorTextMatch { Match, Mismatch, Unavailable }
+
 public sealed class SendInputService
 {
     private const string ExcludeClipboardFormat = "ExcludeClipboardContentFromMonitorProcessing";
@@ -34,6 +36,81 @@ public sealed class SendInputService
     public SendInputService(PhysicalKeyState? physicalKeys = null) => _physicalKeys = physicalKeys ?? new PhysicalKeyState();
 
     public bool WaitForPhysicalKeysReleased() => _physicalKeys.WaitUntilReleased(TimeSpan.FromMilliseconds(750));
+
+    internal EditorTextMatch CheckPreviousText(string original, out string diagnostic)
+    {
+        diagnostic = "stage=read-only-editor-unavailable";
+        try
+        {
+            var focused = AutomationElement.FocusedElement;
+            if (focused is null || focused.Current.IsPassword || original.Length == 0)
+                return EditorTextMatch.Unavailable;
+            var mismatch = false;
+            var details = new List<string>();
+            foreach (var element in ReplacementCandidates(focused))
+            {
+                var result = CheckPreviousTextForElement(element, original, out var detail);
+                details.Add(detail);
+                if (result == EditorTextMatch.Match) { diagnostic = detail; return result; }
+                mismatch |= result == EditorTextMatch.Mismatch;
+            }
+            diagnostic = string.Join(" | ", details);
+            return mismatch ? EditorTextMatch.Mismatch : EditorTextMatch.Unavailable;
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or
+                                   UnauthorizedAccessException or ArgumentException)
+        {
+            diagnostic = $"stage=read-only-editor-unavailable type={ex.GetType().Name}";
+            return EditorTextMatch.Unavailable;
+        }
+    }
+
+    internal static EditorTextMatch CheckPreviousTextForElement(AutomationElement element, string original,
+        out string diagnostic)
+    {
+        diagnostic = "stage=read-only-pattern-unavailable";
+        if (element.Current.IsPassword || original.Length == 0) return EditorTextMatch.Unavailable;
+        var mismatch = false;
+        if (element.TryGetCurrentPattern(TextPattern.Pattern, out var rawText) && rawText is TextPattern textPattern)
+        {
+            var selections = textPattern.GetSelection();
+            if (selections.Length != 1 || selections[0].CompareEndpoints(TextPatternRangeEndpoint.Start,
+                    selections[0], TextPatternRangeEndpoint.End) != 0)
+            {
+                diagnostic = "stage=read-only-selection-unavailable";
+                return EditorTextMatch.Unavailable;
+            }
+            var expected = NormalizeNewlines(original);
+            var suffix = selections[0].Clone();
+            if (suffix.MoveEndpointByUnit(TextPatternRangeEndpoint.Start, TextUnit.Character, -expected.Length) ==
+                -expected.Length)
+            {
+                var actual = NormalizeNewlines(suffix.GetText(-1));
+                if (IsEditorEquivalent(expected, actual))
+                {
+                    diagnostic = "stage=read-only-text-confirmed";
+                    return EditorTextMatch.Match;
+                }
+                mismatch = true;
+                diagnostic = "stage=read-only-text-mismatch " + DescribeMismatch(expected, actual);
+            }
+        }
+        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var rawValue) && rawValue is ValuePattern valuePattern &&
+            !valuePattern.Current.IsReadOnly)
+        {
+            var value = valuePattern.Current.Value;
+            var expected = MatchNativeNewlines(value, original);
+            var actual = value.Length <= expected.Length ? value : value[^expected.Length..];
+            if (IsEditorEquivalent(expected, actual))
+            {
+                diagnostic = "stage=read-only-value-confirmed";
+                return EditorTextMatch.Match;
+            }
+            mismatch = true;
+            diagnostic += " value=[" + DescribeMismatch(expected, actual) + "]";
+        }
+        return mismatch ? EditorTextMatch.Mismatch : EditorTextMatch.Unavailable;
+    }
 
     public bool ReplacePreviousText(string original, string replacement, Func<bool>? canCommit = null)
     {
@@ -93,6 +170,12 @@ public sealed class SendInputService
         return FailureOccurredBeforeMutation(diagnostic) ||
                diagnostic?.Contains("original-selection-confirmed=True", StringComparison.OrdinalIgnoreCase) == true;
     }
+
+    internal static bool ConfirmsOriginalTextChanged(string? diagnostic) =>
+        FailureOccurredBeforeMutation(diagnostic) &&
+        diagnostic?.Contains("selection", StringComparison.OrdinalIgnoreCase) != true &&
+        (diagnostic?.Contains("stage=text-suffix-mismatch", StringComparison.Ordinal) == true ||
+         diagnostic?.Contains("stage=value-suffix-mismatch", StringComparison.Ordinal) == true);
 
     internal static bool RecoverySucceeded(string? diagnostic) =>
         diagnostic?.Contains("recovery=automatic-undo-succeeded", StringComparison.OrdinalIgnoreCase) == true ||
@@ -343,10 +426,14 @@ public sealed class SendInputService
             // refusing range selection. ValuePattern is a safe fallback only when
             // the complete value still ends with the exact expected suffix and there
             // was no active selection when replacement started.
-            if (!valueFallbackAllowed)
+            // An unconfirmed paste may still arrive later. Do not follow it with
+            // SetValue: that could overwrite new typing or apply the edit twice.
+            if (!valueFallbackAllowed || !FailureOccurredBeforeMutation(textDiagnostic))
             {
                 reportFailure?.Invoke($"text=[{textDiagnostic ?? "stage=text-range-unavailable"}] " +
-                                      "fallback=[stage=value-fallback active-selection]");
+                                      (valueFallbackAllowed
+                                          ? "fallback=[stage=value-fallback-skipped-after-mutation]"
+                                          : "fallback=[stage=value-fallback active-selection]"));
                 return false;
             }
             string? valueDiagnostic = null;
@@ -382,11 +469,10 @@ public sealed class SendInputService
         if (!value.EndsWith(nativeOriginal, StringComparison.Ordinal))
         {
             var actualSuffix = value.Length <= nativeOriginal.Length ? value : value[^nativeOriginal.Length..];
-            if (IsLeadingCaseOnlyDifference(nativeOriginal, actualSuffix))
+            if (IsEditorEquivalent(nativeOriginal, actualSuffix))
             {
-                // Some editors capitalize the first character without raising an input
-                // event. Reconcile only that one harmless difference; every remaining
-                // character must still match exactly before we touch the control.
+                // Reconcile only known editor typography or initial capitalization.
+                // Use the actual range for every exact document/selection guard.
                 nativeOriginal = actualSuffix;
             }
             else
@@ -451,7 +537,7 @@ public sealed class SendInputService
             var rangeText = NormalizeNewlines(range.GetText(-1));
             if (!string.Equals(rangeText, normalizedOriginal, StringComparison.Ordinal))
             {
-                if (IsLeadingCaseOnlyDifference(normalizedOriginal, rangeText))
+                if (IsEditorEquivalent(normalizedOriginal, rangeText))
                 {
                     normalizedOriginal = rangeText;
                     fullOriginal = rangeText;
@@ -998,8 +1084,31 @@ public sealed class SendInputService
         var actualKind = prefix < actual.Length ? CharacterKind(actual[prefix]) : "end-of-text";
         var caseEquivalent = string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase)
             .ToString().ToLowerInvariant();
+        var punctuation = string.Empty;
+        if (expectedKind == "punctuation") punctuation += $" expectedPunctuation=U+{(int)expected[prefix]:X4}";
+        if (actualKind == "punctuation") punctuation += $" actualPunctuation=U+{(int)actual[prefix]:X4}";
         return $"mismatchIndex={prefix} commonSuffix={suffix} expectedKind={expectedKind} actualKind={actualKind} " +
-               $"caseEquivalent={caseEquivalent}";
+               $"caseEquivalent={caseEquivalent} editorEquivalent={IsEditorEquivalent(expected, actual)}{punctuation}";
+    }
+
+    internal static bool IsEditorEquivalent(string expected, string actual)
+    {
+        if (expected.Length != actual.Length) return false;
+        for (var index = 0; index < expected.Length; index++)
+        {
+            var left = expected[index];
+            var right = actual[index];
+            if (left == right) continue;
+            if (index == 0 && char.IsLetter(left) && char.IsLetter(right) &&
+                char.ToUpperInvariant(left) == char.ToUpperInvariant(right) &&
+                char.ToLowerInvariant(left) == char.ToLowerInvariant(right)) continue;
+            if (left == '\'' && right is '\u2018' or '\u2019' ||
+                right == '\'' && left is '\u2018' or '\u2019' ||
+                left == '"' && right is '\u201C' or '\u201D' ||
+                right == '"' && left is '\u201C' or '\u201D') continue;
+            return false;
+        }
+        return true;
     }
 
     internal static bool IsLeadingCaseOnlyDifference(string expected, string actual)

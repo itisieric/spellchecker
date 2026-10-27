@@ -1,12 +1,14 @@
 namespace LLMAutocorrect.Correction;
 
-internal sealed record MutationAttempt<T>(T Result, string? Diagnostic) where T : struct;
+internal sealed record MutationAttempt<T>(T Result, string? Diagnostic,
+    bool OriginalTextChanged = false) where T : struct;
 
 internal enum MutationStopReason
 {
     None,
     CurrentnessLost,
     AmbiguousMutation,
+    OriginalTextChanged,
     AttemptsExhausted
 }
 
@@ -17,10 +19,10 @@ internal sealed record MutationRetryOutcome<T>(
     IReadOnlyList<string> Diagnostics,
     MutationStopReason StopReason) where T : struct
 {
-    // The attempt ran, but its diagnostic could not prove that no mutation
-    // occurred. Callers that mirror editor text must stop trusting that mirror.
+    // Either a paste was unconfirmed or the editor proved that the original
+    // tracked text is stale. Neither result permits trusting the text mirror.
     public bool ShouldInvalidateTrackedText =>
-        Attempts > 0 && StopReason == MutationStopReason.AmbiguousMutation;
+        Attempts > 0 && StopReason is MutationStopReason.AmbiguousMutation or MutationStopReason.OriginalTextChanged;
 }
 
 internal static class SafeMutationRetry
@@ -53,6 +55,8 @@ internal static class SafeMutationRetry
             diagnostics.Add($"attempt={index + 1} {current.Diagnostic ?? "stage=unspecified"}");
             if (succeeded(current.Result))
                 return new(true, index + 1, lastResult, diagnostics, MutationStopReason.None);
+            if (current.OriginalTextChanged)
+                return new(false, index + 1, lastResult, diagnostics, MutationStopReason.OriginalTextChanged);
             if (safeToRetry is not null && !safeToRetry(current.Result, current.Diagnostic))
                 return new(false, index + 1, lastResult, diagnostics, MutationStopReason.AmbiguousMutation);
         }

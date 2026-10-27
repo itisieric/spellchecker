@@ -33,6 +33,10 @@ The safety rule is simple: when focus, caret position, application, password sta
 - A ranked Excel spelling-history workbook that groups attempted misspellings under the corrected word.
 - One automatic retry for an uncertain or temporarily failed correction, with an optional non-focus-stealing explanation popup.
 - Configurable stale-safe insertion retries. Every retry reacquires the focused editor and rechecks the window, input version, caret context, original text, and released physical keys before changing anything.
+- Manual corrections can restore focus to the captured editor after a browser context menu closes, only while the original range, window, and input version still match. Focus failures before a paste are reported as no text changed and can be retried safely.
+- An unconfirmed paste never falls through to a whole-value replacement. Manual editor waits run off the tray UI thread so typing and clicks continue to cancel pending edits.
+- A read-only suffix check detects stale text before requesting a model correction. A confirmed mismatch starts a fresh typing segment; it cannot clear input from a newer version. Autocomplete also checks that the tracked segment remains synchronized.
+- Exact replacement guards tolerate only initial-letter casing and straight/curly quote formatting. Other punctuation, words, numbers, whitespace, selections, and cursor changes remain protected. Punctuation mismatch diagnostics include character codes without recording sentence text.
 - Autocomplete retries only failures proven to occur before insertion; ambiguous paste results stop and invalidate the tracked suffix to prevent duplicate text.
 - Deliberate provider latency setting for stale-response testing.
 - Physical-key release gating prevents accepted suggestions from being injected while Tab or a modifier is still held.
@@ -73,6 +77,13 @@ For a provider on another computer, enter a LAN address such as `http://192.168.
 
 ## Build and test
 
+The application icon is maintained as editable, font-independent artwork in
+`src/LLMAutocorrect/Assets/Spellchecker.svg`. Run `scripts/build-icon.ps1` on Windows
+to regenerate its PNG and multi-resolution ICO (16 through 256 pixels). The same
+icon is embedded in the executable, loaded by the tray and Settings window, and
+published as `Spellchecker.ico` for desktop/pinned shortcuts. This asset-only build
+step uses Windows drawing libraries and does not call an image-generation service.
+
 From PowerShell:
 
 ```powershell
@@ -86,6 +97,16 @@ dotnet restore .\LLMAutocorrect.sln
 dotnet build .\LLMAutocorrect.sln -c Release --no-restore
 dotnet run --project .\tests\LLMAutocorrect.Tests\LLMAutocorrect.Tests.csproj -c Release --no-build
 ```
+
+For the current G: Ollama installation, `scripts/benchmark-ollama.ps1 -Experiment Generation`
+compares the unchanged correction prompt, a successful-response explanation suppression rule,
+and two n-gram speculative modes. It uses only synthetic text and a loopback-only temporary
+server, briefly stops the verified Spellchecker executable, and restores the production model
+and app in cleanup. It never saves experimental environment variables or modifies model files.
+Each run creates a fresh timestamped artifact folder. Build the tests first, then pass that
+folder's `samples.json` to the test executable with `--validate-provider-benchmark` to evaluate
+the generated responses through the unchanged production correction validator. Synthetic
+benchmark results may include synthetic text; ordinary application diagnostics remain metadata-only.
 
 Run the framework-dependent app:
 
@@ -116,6 +137,10 @@ The app starts in the system tray. Autocorrect defaults to Conservative mode. Au
 Tab is intercepted only while a current, focus-matched suggestion is visible. Otherwise the target application receives Tab normally. When the overlay shows multiple options, press Alt+Down to move to the next option, then Tab to accept the displayed option.
 
 Ordinary settings live in `%APPDATA%\LLMAutocorrect\settings.json`. Provider secrets live separately in Windows Credential Manager under `LLMAutocorrect/AIProvider/...`. Dictionary terms live one-per-line in `%APPDATA%\LLMAutocorrect\dictionary.txt`. Personal memory lives in `%APPDATA%\LLMAutocorrect\memory.json`. Ranked spelling history is written to `%APPDATA%\LLMAutocorrect\spelling-history.xlsx`. Diagnostics are metadata-only at `%APPDATA%\LLMAutocorrect\logs\diagnostics.log`.
+
+Startup diagnostics include a `BuildId` identifying the compiled application. An `editor-text-mismatch` skip with `ProviderRequested=False` means the read-only check found stale text before any model request or editor mutation.
+
+Each log line also identifies its app session. Correction and completion operations have a shared operation ID, input version, current stage, provider-attempt number, and elapsed time, so started requests can be matched with completion, cancellation, or failure. Startup and saved-settings entries record numeric delays and feature flags without credentials, server addresses, custom instruction text, or typed sentences. Routine unsynchronized skips are coalesced with a suppressed-event count; errors remain individually logged. Log storage remains bounded to the current 2 MB file and one previous file. A logging I/O failure is isolated from correction/retry behavior and is reported on the next successful log write.
 
 Personal memory learns a short continuation only after you explicitly accept it with Tab or Ctrl+Right. It also learns recurring spelling corrections after the same correction succeeds more than once. Phrase prefixes and original misspellings are stored as SHA-256 hashes rather than readable text; only the short accepted continuation or corrected spelling is retained. Sensitive-looking text, text containing digits, and long passages are not saved. You can disable learning or permanently erase the memory under **Settings → Memory**.
 

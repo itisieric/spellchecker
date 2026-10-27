@@ -175,13 +175,21 @@ public sealed partial class ManualCorrectionService
         return true;
     }
 
-    private async Task CorrectAsync(ManualCorrectionTarget target)
+    // The offer invokes this on the WPF thread. Keep editor waits off that thread
+    // so the keyboard/mouse hooks can cancel a pending edit as input resumes.
+    private Task CorrectAsync(ManualCorrectionTarget target)
     {
+        var operationVersion = _clock.Current;
+        return Task.Run(() => CorrectCoreAsync(target, operationVersion));
+    }
+
+    private async Task CorrectCoreAsync(ManualCorrectionTarget target, long operationVersion)
+    {
+        using var logOperation = _logger.BeginOperation("manual-correction", target.Window.ProcessName, operationVersion);
         if (!await _correctionGate.WaitAsync(0)) return;
         try
         {
-            if (!_foreground.Matches(target.Window.WindowHandle, target.Window.ProcessId)) return;
-            var operationVersion = _clock.Current;
+            if (!ManualOperationIsCurrent(target, operationVersion)) return;
             var settings = _settings.Current;
             var preserveAddressBarStyle = ShouldPreserveAddressBarStyle(settings, _focused.GetCurrent(), target.Window.ProcessName);
             var protectedTokens = _tokens.Detect(target.OriginalText, _dictionary.Terms);
@@ -195,21 +203,34 @@ public sealed partial class ManualCorrectionService
             var maximumEditRatio = Math.Max(.60, settings.MaximumEditRatio);
             try
             {
-                try { result = await _provider.CorrectAsync(request, CancellationToken.None); }
+                try
+                {
+                    _logger.MarkProviderRequest();
+                    await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+                        { ["Provider"] = settings.Provider.ToString(), ["TargetLength"] = target.OriginalText.Length });
+                    result = await _provider.CorrectAsync(request, CancellationToken.None);
+                }
                 catch (ProviderUnavailableException ex) when (ex.IsRetryable &&
                                                                ManualOperationIsCurrent(target, operationVersion))
                 {
+                    _logger.SetOperationStage("provider-retry-delay");
                     await Task.Delay(settings.CorrectionRetryDelayMs);
                     if (!ManualOperationIsCurrent(target, operationVersion))
                     {
+                        await _logger.WriteAsync("ManualCorrectionCancelled", new Dictionary<string, object?>
+                            { ["CurrentInputVersion"] = _clock.Current, ["InputChanged"] = _clock.Current != operationVersion });
                         ShowStatus(target, "Correction cancelled because the text or cursor changed.");
                         return;
                     }
+                    _logger.MarkProviderRequest();
+                    await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+                        { ["Provider"] = settings.Provider.ToString(), ["TargetLength"] = target.OriginalText.Length, ["Retry"] = true });
                     result = await _provider.CorrectAsync(request, CancellationToken.None);
                     await _logger.WriteAsync("ManualCorrectionProviderRetrySucceeded",
                         new Dictionary<string, object?> { ["Process"] = target.Window.ProcessName });
                 }
 
+                _logger.SetOperationStage("validation");
                 validation = _validator.Validate(request, result, maximumEditRatio);
                 if (CorrectionResponseRetry.ShouldRetry(validation, responseRetryAttempted,
                         ManualOperationIsCurrent(target, operationVersion)))
@@ -217,20 +238,17 @@ public sealed partial class ManualCorrectionService
                     initialValidation = validation.Reason;
                     responseRetryAttempted = true;
                     request = CorrectionResponseRetry.CreateStrictRequest(request);
+                    _logger.MarkProviderRequest();
+                    await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+                        { ["Provider"] = settings.Provider.ToString(), ["TargetLength"] = target.OriginalText.Length, ["Retry"] = true });
                     result = await _provider.CorrectAsync(request, CancellationToken.None);
+                    _logger.SetOperationStage("validation");
                     validation = _validator.Validate(request, result, maximumEditRatio);
                 }
             }
             catch (Exception ex)
             {
-                var metadata = new Dictionary<string, object?> { ["Type"] = ex.GetType().Name };
-                if (ex is ProviderUnavailableException provider)
-                {
-                    metadata["HttpStatus"] = provider.StatusCode;
-                    metadata["ProviderStatus"] = provider.ProviderStatus;
-                    metadata["Retryable"] = provider.IsRetryable;
-                    metadata["Reason"] = provider.Message;
-                }
+                var metadata = DiagnosticMetadata.Failure(ex);
                 await _logger.WriteAsync("ManualCorrectionFailed", metadata);
                 ShowStatus(target, ex is ProviderUnavailableException unavailable
                     ? unavailable.UserMessage
@@ -239,6 +257,11 @@ public sealed partial class ManualCorrectionService
             }
             if (!result.ShouldReplace)
             {
+                await _logger.WriteAsync("ManualCorrectionNoChange", new Dictionary<string, object?>
+                {
+                    ["Uncertain"] = result.Uncertain, ["ReasonProvided"] = !string.IsNullOrWhiteSpace(result.Reason),
+                    ["CurrentInputVersion"] = _clock.Current
+                });
                 ShowStatus(target, result.Uncertain
                     ? "Not corrected: " + CleanReason(result.Reason)
                     : "No spelling correction was needed.");
@@ -260,6 +283,7 @@ public sealed partial class ManualCorrectionService
                 return;
             }
             var replacement = result.Replacement.Trim();
+            _logger.SetOperationStage("mutation");
             var mutation = await SafeMutationRetry.RunAsync(
                 settings.InsertionRetryAttempts,
                 settings.InsertionRetryDelayMs,
@@ -267,13 +291,18 @@ public sealed partial class ManualCorrectionService
                     () => ManualOperationIsCurrent(target, operationVersion), _input.WaitForPhysicalKeysReleased),
                 () =>
                 {
-                    if (!TryRefreshTarget(target, out var applyTarget, out var refreshDiagnostic))
+                    if (!TryRefreshTarget(target, out var applyTarget, out var refreshDiagnostic,
+                            () => ManualOperationIsCurrent(target, operationVersion)))
                         return new MutationAttempt<TextReplacementResult>(TextReplacementResult.EditorUnavailable,
                             refreshDiagnostic);
                     var applyResult = _input.ReplaceTextRangeDetailed(applyTarget.Element, applyTarget.Range,
                         applyTarget.OriginalText, replacement,
-                        () => ManualOperationIsCurrent(target, operationVersion), out var applyDiagnostic);
-                    return new MutationAttempt<TextReplacementResult>(applyResult, applyDiagnostic);
+                        () => ManualOperationIsCurrent(target, operationVersion) && TargetEditorIsFocused(applyTarget),
+                        out var applyDiagnostic);
+                    return new MutationAttempt<TextReplacementResult>(applyResult,
+                        applyResult == TextReplacementResult.Applied
+                            ? $"{refreshDiagnostic} | {applyDiagnostic}"
+                            : applyDiagnostic);
                 },
                 applyResult => applyResult == TextReplacementResult.Applied,
                 (applyResult, diagnostic) => applyResult == TextReplacementResult.Stale ||
@@ -295,6 +324,9 @@ public sealed partial class ManualCorrectionService
                     ["Result"] = replacementResult.ToString(),
                     ["TargetLength"] = target.OriginalText.Length,
                     ["Attempts"] = mutation.Attempts,
+                    ["CurrentInputVersion"] = _clock.Current,
+                    ["InputChanged"] = _clock.Current != operationVersion,
+                    ["WindowMatches"] = _foreground.Matches(target.Window.WindowHandle, target.Window.ProcessId),
                     ["MutationStopReason"] = effectiveStopReason.ToString(),
                     ["MutationMayHaveOccurred"] = mutation.ShouldInvalidateTrackedText,
                     ["AutomaticRecovery"] = automaticallyRecovered,
@@ -319,7 +351,10 @@ public sealed partial class ManualCorrectionService
             ShowStatus(target, $"{target.OriginalText} → {replacement}");
             await _logger.WriteAsync("ManualCorrectionCompleted", new Dictionary<string, object?>
             {
+                ["Process"] = target.Window.ProcessName,
                 ["Characters"] = target.OriginalText.Length,
+                ["Attempts"] = mutation.Attempts,
+                ["Diagnostic"] = string.Join(" || ", mutation.Diagnostics),
                 ["EditRatio"] = validation.EditRatio.ToString("F3"),
                 ["ResponseRetryAttempted"] = responseRetryAttempted,
                 ["InitialValidation"] = initialValidation
@@ -339,20 +374,52 @@ public sealed partial class ManualCorrectionService
         _foreground.Matches(target.Window.WindowHandle, target.Window.ProcessId);
 
     internal static bool TryRefreshTarget(ManualCorrectionTarget target, out ManualCorrectionTarget refreshed,
-        out string diagnostic)
+        out string diagnostic, Func<bool>? canRestoreFocus = null)
     {
         refreshed = null!;
-        diagnostic = "stage=refresh-focused-element-unavailable";
+        diagnostic = "stage=refresh-focused-element-unavailable mutationAttempted=False";
         try
         {
-            var focused = AutomationElement.FocusedElement;
-            if (focused is null) return false;
-            var candidates = SendInputService.ReplacementCandidates(focused).ToArray();
-            if (!candidates.Any(candidate => string.Equals(SafeRuntimeId(candidate), target.FocusedElementId,
-                    StringComparison.Ordinal)))
+            if (canRestoreFocus is not null && !canRestoreFocus())
             {
-                diagnostic = "stage=refresh-focused-editor-changed";
+                diagnostic = "stage=refresh-stale mutationAttempted=False";
                 return false;
+            }
+            var focused = AutomationElement.FocusedElement;
+            var candidates = focused is null ? [] : SendInputService.ReplacementCandidates(focused).ToArray();
+            var focusRestored = false;
+            if (!ContainsTargetEditor(candidates, target))
+            {
+                // Closing a browser context menu can put focus on the document or
+                // browser chrome. The explicit manual request still names a live
+                // range in one editor. Restore only that captured editor, while no
+                // new input has occurred and its original window is foreground.
+                if (canRestoreFocus is not null && canRestoreFocus() &&
+                    NativeMethods.GetForegroundWindow() == target.Window.WindowHandle &&
+                    TargetBelongsToWindow(target) && TryValidateCapturedTarget(target, out _) &&
+                    canRestoreFocus())
+                {
+                    target.Element.SetFocus();
+                    var deadline = Environment.TickCount64 + 150;
+                    do
+                    {
+                        if (!canRestoreFocus())
+                        {
+                            diagnostic = "stage=refresh-stale mutationAttempted=False";
+                            return false;
+                        }
+                        focused = AutomationElement.FocusedElement;
+                        candidates = focused is null ? [] : SendInputService.ReplacementCandidates(focused).ToArray();
+                        if (ContainsTargetEditor(candidates, target)) { focusRestored = true; break; }
+                        if (Environment.TickCount64 >= deadline) break;
+                        Thread.Sleep(10);
+                    } while (true);
+                }
+                if (!ContainsTargetEditor(candidates, target))
+                {
+                    diagnostic = $"stage=refresh-focused-editor-changed mutationAttempted=False {DescribeFocus(focused, target)}";
+                    return false;
+                }
             }
 
             // Clicking the non-activating correction offer can collapse the visible
@@ -362,33 +429,67 @@ public sealed partial class ManualCorrectionService
             // a selected sentence back into only the word under the click point.
             if (TryValidateCapturedTarget(target, out refreshed))
             {
-                diagnostic = "stage=refresh-original-range-confirmed";
+                diagnostic = $"stage=refresh-original-range-confirmed focusRestored={focusRestored}";
                 return true;
             }
 
             foreach (var candidate in candidates)
             {
                 var runtimeId = SafeRuntimeId(candidate);
-                if (target.CapturePoint is null && target.FocusedElementId != runtimeId) continue;
+                // Never search another editor for an identical word or sentence.
+                if (target.FocusedElementId != runtimeId) continue;
                 if (!TryCaptureFromElement(candidate, target.Window, target.CapturePoint, out var captured)) continue;
                 if (!string.Equals(captured.OriginalText, target.OriginalText, StringComparison.Ordinal))
                 {
-                    diagnostic = "stage=refresh-text-changed";
+                    diagnostic = "stage=refresh-text-changed mutationAttempted=False";
                     continue;
                 }
                 refreshed = captured;
-                diagnostic = "stage=refresh-confirmed";
+                diagnostic = $"stage=refresh-confirmed focusRestored={focusRestored}";
                 return true;
             }
-            diagnostic = "stage=refresh-target-not-found";
+            diagnostic = "stage=refresh-target-not-found mutationAttempted=False";
             return false;
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException or ArgumentException)
         {
-            diagnostic = $"stage=refresh-exception type={ex.GetType().Name} hresult={ex.HResult}";
+            diagnostic = $"stage=refresh-exception type={ex.GetType().Name} hresult={ex.HResult} mutationAttempted=False";
             return false;
         }
     }
+
+    private static bool ContainsTargetEditor(IEnumerable<AutomationElement> candidates, ManualCorrectionTarget target) =>
+        candidates.Any(candidate => string.Equals(SafeRuntimeId(candidate), target.FocusedElementId,
+            StringComparison.Ordinal));
+
+    internal static bool TargetEditorIsFocused(ManualCorrectionTarget target)
+    {
+        try
+        {
+            var focused = AutomationElement.FocusedElement;
+            return focused is not null && ContainsTargetEditor(SendInputService.ReplacementCandidates(focused), target);
+        }
+        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or
+                                   UnauthorizedAccessException or ArgumentException) { return false; }
+    }
+
+    private static bool TargetBelongsToWindow(ManualCorrectionTarget target)
+    {
+        var current = target.Element;
+        for (var depth = 0; current is not null && depth < 32; depth++)
+        {
+            if (new IntPtr(current.Current.NativeWindowHandle) == target.Window.WindowHandle)
+                return current.Current.ProcessId == target.Window.ProcessId;
+            current = TreeWalker.RawViewWalker.GetParent(current);
+        }
+        return false;
+    }
+
+    private static string DescribeFocus(AutomationElement? focused, ManualCorrectionTarget target) =>
+        $"focusedType={focused?.Current.ControlType.ProgrammaticName ?? "none"} " +
+        $"focusedClass={(focused?.Current.ClassName ?? "none").Replace(' ', '_')} " +
+        $"targetType={target.Element.Current.ControlType.ProgrammaticName} " +
+        $"targetClass={(target.Element.Current.ClassName ?? "none").Replace(' ', '_')}";
 
     private static bool TryValidateCapturedTarget(ManualCorrectionTarget target,
         out ManualCorrectionTarget refreshed)
@@ -396,7 +497,8 @@ public sealed partial class ManualCorrectionService
         refreshed = null!;
         try
         {
-            if (target.Element.Current.IsPassword) return false;
+            if (target.Element.Current.IsPassword ||
+                !string.Equals(SafeRuntimeId(target.Element), target.FocusedElementId, StringComparison.Ordinal)) return false;
             var range = target.Range.Clone();
             if (!string.Equals(NormalizeNewlines(range.GetText(-1)), NormalizeNewlines(target.OriginalText),
                     StringComparison.Ordinal)) return false;
@@ -421,7 +523,11 @@ public sealed partial class ManualCorrectionService
     private static string NormalizeNewlines(string value) =>
         value.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
 
-    internal static string ReplacementFailureMessage(TextReplacementResult result, string? diagnostic = null) => result switch
+    internal static string ReplacementFailureMessage(TextReplacementResult result, string? diagnostic = null) =>
+        diagnostic?.Contains("stage=refresh-", StringComparison.Ordinal) == true &&
+        SendInputService.FailureOccurredBeforeMutation(diagnostic)
+            ? "The original text field could not be reconnected safely. Nothing was changed. Click the field and try Ctrl+Alt+C."
+            : result switch
     {
         TextReplacementResult.Stale =>
             "Correction cancelled because new input, focus, or editor state changed.",

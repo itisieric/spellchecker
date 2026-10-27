@@ -115,6 +115,8 @@ public sealed class AutocompleteCoordinator : IDisposable
 
     private async Task RunScheduledAsync(TypingSnapshot snapshot, CancellationToken cancellationToken)
     {
+        using var logOperation = _logger.BeginOperation(IsTerminal(snapshot.Window.ProcessName)
+            ? "terminal-autocomplete" : "autocomplete", snapshot.Window.ProcessName, snapshot.BufferVersion);
         try
         {
             var delay = IsTerminal(snapshot.Window.ProcessName)
@@ -123,11 +125,16 @@ public sealed class AutocompleteCoordinator : IDisposable
             await Task.Delay(delay, cancellationToken);
             await ProcessAsync(snapshot, cancellationToken);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            if (_logger.OperationContactedProvider)
+                await _logger.WriteAsync("AutocompleteCancelled", new Dictionary<string, object?>
+                    { ["CurrentInputVersion"] = _clock.Current, ["InputChanged"] = _clock.Current != snapshot.BufferVersion });
+        }
         catch (Exception ex)
         {
             Dismiss();
-            await _logger.WriteAsync("AutocompleteFailed", new Dictionary<string, object?> { ["Type"] = ex.GetType().Name });
+            await _logger.WriteAsync("AutocompleteFailed", DiagnosticMetadata.Failure(ex));
         }
     }
 
@@ -172,21 +179,35 @@ public sealed class AutocompleteCoordinator : IDisposable
             return;
         }
         var interval = TimeSpan.FromMilliseconds(settings.MinimumAutocompleteRequestIntervalMs) - (DateTimeOffset.UtcNow - _lastRequest);
+        _logger.SetOperationStage("throttle");
         if (interval > TimeSpan.Zero) await Task.Delay(interval, cancellationToken);
         _lastRequest = DateTimeOffset.UtcNow;
 
         var request = new AutocompleteRequest(context, RelevantTechnicalTerms(context, _dictionary.Terms), settings.AutocompleteCandidates,
             settings.AutocompleteMode == AutocompleteMode.Conservative ? 6 : settings.AutocompleteMode == AutocompleteMode.Normal ? 10 : 16,
             settings.AutocompleteMode);
-        var stopwatch = Stopwatch.StartNew();
+        var stopwatch = new Stopwatch();
+        _logger.MarkProviderRequest();
+        await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+            { ["Provider"] = settings.Provider.ToString(), ["ContextChars"] = context.Length });
+        stopwatch.Start();
         var result = await _provider.PredictAsync(request, cancellationToken);
         _lastContextHash = hash;
         stopwatch.Stop();
-        if (!StillCurrent(snapshot, focus)) return;
+        _logger.SetOperationStage("validation");
+        if (!StillCurrent(snapshot, focus)) { await LogSkipAsync(snapshot, "stale-after-provider"); return; }
 
         var candidates = result.Candidates.Select(x => _validator.Normalize(context, x.Text, settings.MaximumSuggestionCharacters))
             .Where(x => x is not null).Cast<string>().Distinct(StringComparer.Ordinal).Take(settings.AutocompleteCandidates).ToArray();
-        if (candidates.Length == 0) return;
+        if (candidates.Length == 0)
+        {
+            await _logger.WriteAsync("AutocompleteNoSuggestion", new Dictionary<string, object?>
+            {
+                ["ReturnedCandidates"] = result.Candidates.Count, ["AcceptedCandidates"] = 0,
+                ["LatencyMs"] = stopwatch.ElapsedMilliseconds
+            });
+            return;
+        }
         ShowSuggestions(snapshot, focus, candidates, false);
         await _logger.WriteAsync("AutocompleteCompleted", new Dictionary<string, object?>
         {
@@ -227,6 +248,7 @@ public sealed class AutocompleteCoordinator : IDisposable
 
         var interval = TimeSpan.FromMilliseconds(settings.MinimumTerminalRequestIntervalMs) -
                        (DateTimeOffset.UtcNow - _lastTerminalRequest);
+        _logger.SetOperationStage("throttle");
         if (interval > TimeSpan.Zero) await Task.Delay(interval, cancellationToken);
         _lastTerminalRequest = DateTimeOffset.UtcNow;
 
@@ -237,24 +259,38 @@ public sealed class AutocompleteCoordinator : IDisposable
         var request = new TerminalAutocompleteRequest(shell, currentCommand,
             snapshot.Window.WindowTitle.Length > 200 ? snapshot.Window.WindowTitle[..200] : snapshot.Window.WindowTitle,
             recent, matchingHistory.Take(20).ToArray(), maximum, settings.TerminalCustomInstructions);
-        var stopwatch = Stopwatch.StartNew();
+        var stopwatch = new Stopwatch();
         AutocompleteResult result;
+        _logger.MarkProviderRequest();
+        await _logger.WriteAsync("ProviderRequestStarted", new Dictionary<string, object?>
+            { ["Provider"] = settings.Provider.ToString(), ["ContextChars"] = currentCommand.Length });
+        stopwatch.Start();
         try { result = await _terminalProvider.PredictAsync(request, cancellationToken); }
-        catch when (historyCandidates.Count > 0 && !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (historyCandidates.Count > 0 && !cancellationToken.IsCancellationRequested)
         {
+            await _logger.WriteAsync("TerminalAutocompleteProviderFallback", DiagnosticMetadata.Failure(ex));
             _lastTerminalContextHash = hash;
             await LogTerminalCompletedAsync("HistoryFallback", stopwatch.ElapsedMilliseconds, currentCommand.Length, historyCandidates.Count);
             return;
         }
         stopwatch.Stop();
+        _logger.SetOperationStage("validation");
         _lastTerminalContextHash = hash;
-        if (!StillCurrent(snapshot, focus)) return;
+        if (!StillCurrent(snapshot, focus)) { await LogTerminalSkipAsync(snapshot, "stale-after-provider"); return; }
 
         var candidates = historyCandidates.Concat(result.Candidates
                 .Select(candidate => _terminalValidator.Normalize(currentCommand, candidate.Text))
                 .Where(candidate => candidate is not null).Cast<string>())
             .Distinct(StringComparer.OrdinalIgnoreCase).Take(maximum).ToArray();
-        if (candidates.Length == 0) return;
+        if (candidates.Length == 0)
+        {
+            await _logger.WriteAsync("TerminalAutocompleteNoSuggestion", new Dictionary<string, object?>
+            {
+                ["ReturnedCandidates"] = result.Candidates.Count, ["AcceptedCandidates"] = 0,
+                ["LatencyMs"] = stopwatch.ElapsedMilliseconds
+            });
+            return;
+        }
         ShowSuggestions(snapshot, focus, candidates, true);
         await LogTerminalCompletedAsync(ProviderClient.DisplayName(settings.Provider) + "+History",
             stopwatch.ElapsedMilliseconds, currentCommand.Length, candidates.Length);
@@ -349,6 +385,8 @@ public sealed class AutocompleteCoordinator : IDisposable
     private bool CanInsert(SuggestionState.StateData state)
     {
         if (!state.IsVisible || _clock.Current != state.BufferVersion || !_foreground.Matches(state.WindowHandle, state.ProcessId)) return false;
+        var buffer = _buffer.GetSnapshot();
+        if (!buffer.IsSynchronized || buffer.BufferVersion != state.BufferVersion) return false;
         var focus = _focused.GetCurrent();
         return !focus.IsPassword && (state.FocusedElementId is null || focus.RuntimeId is null || state.FocusedElementId == focus.RuntimeId);
     }
@@ -366,6 +404,8 @@ public sealed class AutocompleteCoordinator : IDisposable
     private bool StillCurrent(TypingSnapshot snapshot, FocusedControlIdentity originalFocus)
     {
         if (_clock.Current != snapshot.BufferVersion || !_foreground.Matches(snapshot.Window.WindowHandle, snapshot.Window.ProcessId)) return false;
+        var buffer = _buffer.GetSnapshot();
+        if (!buffer.IsSynchronized || buffer.BufferVersion != snapshot.BufferVersion) return false;
         var currentFocus = _focused.GetCurrent();
         return !currentFocus.IsPassword && (originalFocus.RuntimeId is null || currentFocus.RuntimeId is null ||
                                              originalFocus.RuntimeId == currentFocus.RuntimeId);
@@ -395,21 +435,27 @@ public sealed class AutocompleteCoordinator : IDisposable
             _caret.GetCaretScreenPosition(snapshot.Window.WindowHandle), isTerminal);
     }
 
-    private Task LogSkipAsync(TypingSnapshot snapshot, string reason) => _logger.WriteAsync("AutocompleteSkipped",
-        new Dictionary<string, object?>
-        {
-            ["Process"] = snapshot.Window.ProcessName,
-            ["ContextLength"] = snapshot.BufferText.Length,
-            ["Reason"] = reason
-        });
+    private Task LogSkipAsync(TypingSnapshot snapshot, string reason) =>
+        LogSkipAsync(snapshot, reason, false);
 
-    private Task LogTerminalSkipAsync(TypingSnapshot snapshot, string reason) => _logger.WriteAsync("TerminalAutocompleteSkipped",
-        new Dictionary<string, object?>
+    private Task LogTerminalSkipAsync(TypingSnapshot snapshot, string reason) =>
+        LogSkipAsync(snapshot, reason, true);
+
+    private Task LogSkipAsync(TypingSnapshot snapshot, string reason, bool terminal)
+    {
+        var eventName = terminal ? "TerminalAutocompleteSkipped" : "AutocompleteSkipped";
+        var metadata = new Dictionary<string, object?>
         {
             ["Process"] = snapshot.Window.ProcessName,
             ["ContextLength"] = snapshot.BufferText.Length,
-            ["Reason"] = reason
-        });
+            ["Reason"] = reason,
+            ["CurrentInputVersion"] = _clock.Current,
+            ["InputChanged"] = _clock.Current != snapshot.BufferVersion
+        };
+        return reason == "unsynchronized"
+            ? _logger.WriteRateLimitedAsync(eventName, eventName + ":" + snapshot.Window.ProcessName, metadata)
+            : _logger.WriteAsync(eventName, metadata);
+    }
 
     private Task LogTerminalCompletedAsync(string provider, long latencyMs, int contextLength, int candidates) =>
         _logger.WriteAsync("TerminalAutocompleteCompleted", new Dictionary<string, object?>

@@ -114,6 +114,7 @@ public partial class App : System.Windows.Application
                     (settings.Current.Provider == AiProviderKind.Gemini &&
                      !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GEMINI_API_KEY")))
             });
+            await logger.WriteAsync("SettingsSnapshot", DiagnosticMetadata.Settings(settings.Current));
             if (e.Args.Contains("--shutdown-smoke", StringComparer.Ordinal))
             {
                 await Task.Delay(500);
